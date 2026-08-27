@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: resume-streamlit
+    env: docker
+    dockerfilePath: Dockerfile.streamlit
+    plan: free
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: API_URL
+        value: https://resume-api-femi.fly.dev

@@ -1,0 +1,46 @@
+# Resume Screening Classifier — pinned dependencies
+# Regenerate offline wheel mirror with:
+#   pip download -r requirements.txt -d wheels-linux/ \
+#     --platform manylinux2014_x86_64 --python-version 3.12 --only-binary=:all:
+
+# API + worker
+fastapi==0.141.1
+uvicorn==0.52.4
+python-multipart==0.0.32     # REQUIRED by FastAPI for UploadFile/Form
+celery==5.6.3
+redis==8.1.0
+PyMuPDF==1.28.2
+python-docx==1.2.0           # DOCX resume parsing
+
+# Persistence
+SQLAlchemy==2.0.52
+psycopg2-binary==2.9.12
+alembic==1.19.1
+
+# Streamlit frontend
+streamlit==1.62.0
+streamlit-authenticator==0.3.2
+pandas==3.0.5
+altair==6.2.2
+wordcloud==1.9.4
+matplotlib==3.10.5
+fpdf2==2.8.3
+requests==2.34.2
+
+# Auth (accounts, signup/login, history)
+bcrypt==5.0.0
+itsdangerous==2.2.0
+
+# Observability (tiny — always on)
+prometheus-client==0.26.0
+
+# OPTIONAL ML extras — worker-only heavy deps. Auto-detected at runtime:
+#   pip install sentence-transformers==6.0.0 spacy==3.8.16 scikit-learn==1.9.0 \
+#     "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+# sentence-transformers: semantic scoring (set ENABLE_SEMANTIC=1)
+# spacy + en_core_web_sm: true NER for name/organization extraction
+# scikit-learn: trained role classifier (artifact: models/role_classifier.joblib)
+# Ready-made image: Dockerfile.worker.ml
+# sentence-transformers==6.0.0
+# spacy==3.8.16
+# scikit-learn==1.9.0

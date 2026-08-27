@@ -1,0 +1,10 @@
+app = "resume-worker-femi"
+
+# Set secrets with:
+#   fly secrets set DATABASE_URL="postgresql://..." REDIS_URL="rediss://..." --app resume-worker-femi
+
+[build]
+  dockerfile = "Dockerfile.worker"
+
+# Migrations are applied by the API app's release_command; the worker only
+# needs the same DATABASE_URL / REDIS_URL secrets.

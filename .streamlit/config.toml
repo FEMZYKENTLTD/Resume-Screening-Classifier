@@ -1,0 +1,18 @@
+# Streamlit runtime + "Aurora" theme.
+# Auto-loaded when running `streamlit run app.py` from the repo root.
+
+[server]
+headless = true
+port = 8501
+enableCORS = false
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#7C3AED"
+backgroundColor = "#EEF1F9"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1E293B"
+font = "sans serif"

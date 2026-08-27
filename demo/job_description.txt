@@ -1,0 +1,15 @@
+Senior Data Engineer - Moniepoint-style Fintech (Lagos, hybrid)
+
+We are hiring a Senior Data Engineer to own our analytics pipelines.
+
+Must have:
+- 5+ years experience with Python and SQL
+- Apache Airflow and dbt in production
+- ETL/ELT pipeline design and data modeling (star schema)
+- Cloud data warehouse: BigQuery (GCP) or Snowflake
+- Docker and CI/CD for data workloads
+
+Nice to have: Spark, Kubernetes, streaming (Kafka), fintech domain.
+
+You will build and operate the pipelines that power risk,
+finance and product analytics for millions of transactions daily.

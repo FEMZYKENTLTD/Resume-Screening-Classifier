@@ -1,0 +1,28 @@
+app = "resume-api-femi"
+
+# ⚠️ fly.toml does NOT interpolate ${VAR} placeholders — the old config
+# deployed the literal string "${DATABASE_URL}" and crashed the API.
+# Set real values as Fly secrets instead:
+#   fly secrets set DATABASE_URL="postgresql://..." REDIS_URL="rediss://..." --app resume-api-femi
+
+[build]
+  dockerfile = "Dockerfile.api"
+
+[deploy]
+  release_command = "alembic upgrade head"
+
+[[services]]
+  internal_port = 8000
+  protocol = "tcp"
+
+  [[services.ports]]
+    handlers = ["http"]
+    port = 80
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "2s"

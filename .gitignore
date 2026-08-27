@@ -1,0 +1,49 @@
+# ==================== Secrets — never commit ====================
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.pem
+*.key
+
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ==================== App runtime artifacts ====================
+*.log
+*.db
+*.sqlite3
+resumes.db
+db_data/
+control/                 # Celery filesystem broker (local demo only)
+demo-data/               # local demo DB + broker dirs
+
+# ==================== Offline wheel mirrors (~290 MB) ====================
+# Regenerate with the `pip download` command in requirements.txt — do NOT commit.
+wheels/
+wheels-linux/
+
+# ==================== Build / packaging ====================
+build/
+dist/
+out/
+
+# ==================== OS / editor ====================
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# ==================== Node (future-proofing only) ====================
+node_modules/
