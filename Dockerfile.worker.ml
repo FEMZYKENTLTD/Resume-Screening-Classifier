@@ -1,14 +1,13 @@
 # OPTIONAL worker image with the full ML stack:
 #   semantic embeddings + spaCy NER + trained role classifier.
 # Build:  docker build -f Dockerfile.worker.ml -t resume-worker-ml .
-# Deploy instead of Dockerfile.worker where ML features are wanted
-# (CPU is fine; the classifier model artifact ships in the repo).
+# NOTE: no wheels-linux/ COPY — that mirror is git-ignored and breaks
+# remote builds (Fly/GitHub/Render).
 FROM python:3.12-slim
 WORKDIR /app
 
 COPY requirements.txt .
-COPY wheels-linux/ /wheels/
-RUN pip install --no-cache-dir --find-links=/wheels -r requirements.txt \
+RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir \
        sentence-transformers==6.0.0 \
        spacy==3.8.16 \

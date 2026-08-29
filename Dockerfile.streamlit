@@ -1,9 +1,10 @@
 FROM python:3.12-slim
 WORKDIR /app
 
+# No wheels-linux/ COPY — it is git-ignored, so it does not exist in
+# Render/Git remote build contexts. PyPI serves everything.
 COPY requirements.txt .
-COPY wheels-linux/ /wheels/
-RUN pip install --no-cache-dir --find-links=/wheels -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 RUN mkdir -p /app/.streamlit && cp streamlit_app.toml /app/.streamlit/config.toml

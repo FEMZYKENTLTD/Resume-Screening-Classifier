@@ -1,4 +1,3 @@
-$y = @'
 name: Verify & Deploy Full Stack
 
 on:
@@ -93,5 +92,3 @@ jobs:
           -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
           -H "Content-Type: application/json" \
           https://api.render.com/v1/services/${{ secrets.RENDER_STREAMLIT_ID }}/deploys
-'@
-[IO.File]::WriteAllText((Join-Path (Get-Location) ".github\workflows\deploy.yml"), $y, (New-Object System.Text.UTF8Encoding($false)))
