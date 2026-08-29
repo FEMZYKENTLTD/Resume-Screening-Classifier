@@ -1,10 +1,12 @@
 app = "resume-worker-femi"
+primary_region = "jnb"
 
-# Set secrets with:
+# Secrets (same values as the API app):
 #   fly secrets set DATABASE_URL="postgresql://..." REDIS_URL="rediss://..." --app resume-worker-femi
 
 [build]
   dockerfile = "Dockerfile.worker"
 
-# Migrations are applied by the API app's release_command; the worker only
-# needs the same DATABASE_URL / REDIS_URL secrets.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"   # spaCy NER + sklearn classifier need more than the 256MB default

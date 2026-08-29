@@ -14,6 +14,7 @@ Prometheus/Grafana observability — all deployable with one command.
 ![Celery](https://img.shields.io/badge/Queue-Celery%20%2B%20Redis-37B24D?style=for-the-badge&logo=redis&logoColor=white)
 ![Postgres](https://img.shields.io/badge/Database-PostgreSQL-336791?style=for-the-badge&logo=postgresql&logoColor=white)
 
+[![CI](https://github.com/FEMZYKENTLTD/Resume-Screening-Classifier/actions/workflows/deploy.yml/badge.svg)](https://github.com/FEMZYKENTLTD/Resume-Screening-Classifier/actions/workflows/deploy.yml)
 ![Tests](https://img.shields.io/badge/Tests-31%20unit%20%2B%2021%20live%20E2E-brightgreen?style=for-the-badge)
 ![Docker](https://img.shields.io/badge/Docker-Compose%20Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)

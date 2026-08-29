@@ -1,9 +1,9 @@
 app = "resume-api-femi"
+primary_region = "jnb"   # Johannesburg — nearest Fly region to Lagos
 
-# ⚠️ fly.toml does NOT interpolate ${VAR} placeholders — the old config
-# deployed the literal string "${DATABASE_URL}" and crashed the API.
-# Set real values as Fly secrets instead:
-#   fly secrets set DATABASE_URL="postgresql://..." REDIS_URL="rediss://..." --app resume-api-femi
+# Secrets are set ONCE with flyctl (never committed here):
+#   fly secrets set DATABASE_URL="postgresql://..." REDIS_URL="rediss://..." \
+#     AUTH_SECRET_KEY="..." ADMIN_USERNAMES="admin,femi" --app resume-api-femi
 
 [build]
   dockerfile = "Dockerfile.api"
@@ -11,9 +11,16 @@ app = "resume-api-femi"
 [deploy]
   release_command = "alembic upgrade head"
 
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"   # spaCy NER + sklearn classifier will OOM the 256MB default
+
 [[services]]
   internal_port = 8000
   protocol = "tcp"
+  auto_stop_machines = "off"    # always-on while demoing; `fly scale count 0` pauses billing
+  auto_start_machines = false
+  min_machines_running = 1
 
   [[services.ports]]
     handlers = ["http"]
@@ -23,6 +30,9 @@ app = "resume-api-femi"
     handlers = ["tls", "http"]
     port = 443
 
-  [[services.tcp_checks]]
+  [[services.http_checks]]
     interval = "15s"
-    timeout = "2s"
+    timeout = "5s"
+    grace_period = "120s"       # ML imports are slow on first boot — don't kill it early
+    method = "GET"
+    path = "/health"
