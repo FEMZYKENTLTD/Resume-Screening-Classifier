@@ -17,10 +17,13 @@ import base64
 import datetime as dt
 import json
 import os
+import time
 import uuid
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from pydantic import BaseModel, Field
 from sqlalchemy import func
 
 import auth
@@ -34,7 +37,7 @@ from scoring import overlap_score
 from skills import extract_skills
 from tasks import make_dedup_hash
 
-app = FastAPI(title="Resume Classifier API (Sync)", version="5.2.0")
+app = FastAPI(title="Resume Classifier API (Sync)", version="5.6.0")
 
 MAX_RESUME_BYTES = 10 * 1024 * 1024  # 10 MB safety cap
 
@@ -53,6 +56,31 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def prometheus_middleware(request: Request, call_next):
+    """Record method/route/status/latency for every request (README: every
+    request emits Prometheus metrics). Uses the route template as the path
+    label so dynamic IDs don't explode label cardinality."""
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        monitoring.record_request(
+            request.scope.get("route").path
+            if request.scope.get("route") else "unmatched",
+            method=request.method, status=500,
+            seconds=time.perf_counter() - started,
+        )
+        raise
+    route = request.scope.get("route")
+    monitoring.record_request(
+        getattr(route, "path", None) or "unmatched",
+        method=request.method, status=response.status_code,
+        seconds=time.perf_counter() - started,
+    )
+    return response
+
+
 @app.on_event("startup")
 def startup_event():
     monitoring.init_metrics()
@@ -65,7 +93,8 @@ def health():
 
 @app.get("/metrics")
 def metrics():
-    return monitoring.generate_metrics()
+    body, content_type = monitoring.metrics_response()
+    return Response(content=body, media_type=content_type)
 
 
 def _current_user_id(x_user_token: str | None) -> int | None:
@@ -93,13 +122,18 @@ def _require_admin(x_user_token: str | None) -> int:
         db.close()
 
 
-class Credentials(auth.BaseModel):
-    username: str
-    password: str
+class Credentials(BaseModel):
+    username: str = Field(min_length=1, max_length=50)
+    password: str = Field(min_length=1, max_length=128)
 
 
 class SignupRequest(Credentials):
-    email: str
+    """Signup enforces the account policy; login deliberately stays lenient
+    (any non-empty credentials) so wrong-password attempts surface as 401,
+    not as validation errors. Lengths mirror the users table columns."""
+    username: str = Field(min_length=3, max_length=50)
+    email: str = Field(min_length=3, max_length=100)
+    password: str = Field(min_length=8, max_length=128)
 
 
 def _is_admin_name(username: str) -> bool:
@@ -186,7 +220,6 @@ async def single_analyze(
         )
 
     payload = await resume.read()
-    monitoring.record_request("single_analyze")
 
     if len(payload) > MAX_RESUME_BYTES:
         raise HTTPException(status_code=413, detail="Resume exceeds 10 MB limit.")
@@ -375,6 +408,7 @@ def analytics_summary():
             "total_jobs": total,
             "by_status": by_status,
             "avg_match_score": round(avg_score, 1),
+            "score_histogram": _score_histogram(scores),
             "role_distribution": role_dist,
             "top_skills": top_skills,
             "recent_jobs": recent_jobs,
@@ -387,6 +421,15 @@ def _day(d) -> str:
     return d.strftime("%Y-%m-%d") if d else "unknown"
 
 
+def _score_histogram(scores) -> dict:
+    """Ten 10-wide buckets (0-9 … 90-100) for the dashboards' score charts."""
+    hist = {f"{lo}-{lo + 9}": 0 for lo in range(0, 100, 10)}
+    for s in scores:
+        lo = min(int(s // 10) * 10, 90)
+        hist[f"{lo}-{lo + 9}"] += 1
+    return hist
+
+
 @app.get("/admin/overview")
 def admin_overview(x_user_token: str | None = Header(default=None)):
     _require_admin(x_user_token)
@@ -395,14 +438,33 @@ def admin_overview(x_user_token: str | None = Header(default=None)):
         total_users = db.query(User).count()
         total_jobs = db.query(ResumeResult).count()
         completed = db.query(ResumeResult).filter(ResumeResult.status == JobStatus.COMPLETED).count()
-        scores = [r.jd_match_score for r in db.query(ResumeResult).all() if r.jd_match_score is not None]
+        rows = db.query(ResumeResult).all()
+        scores = [r.jd_match_score for r in rows if r.jd_match_score is not None]
         avg_score = sum(scores) / len(scores) if scores else 0.0
+
+        by_status: dict = {}
+        for value, count in (
+            db.query(ResumeResult.status, func.count(ResumeResult.job_id))
+            .group_by(ResumeResult.status)
+            .all()
+        ):
+            key = value.value if hasattr(value, "value") else str(value)
+            by_status[key] = count
+
+        week_ago = dt.datetime.utcnow() - dt.timedelta(days=7)
+        jobs_last_7d = (
+            db.query(ResumeResult)
+            .filter(ResumeResult.created_at >= week_ago)
+            .count()
+        )
 
         return {
             "total_users": total_users,
             "total_jobs": total_jobs,
             "completed_jobs": completed,
-            "average_score": round(avg_score, 1),
+            "avg_match_score": round(avg_score, 1),
+            "by_status": by_status,
+            "jobs_last_7d": jobs_last_7d,
         }
     finally:
         db.close()
@@ -414,20 +476,51 @@ def admin_users(x_user_token: str | None = Header(default=None)):
     db = SessionLocal()
     try:
         users = db.query(User).order_by(User.created_at.desc()).all()
+
+        # Single scan of the results table; aggregate per user in Python.
+        # (Simple and correct: scores are NULL until a job completes, so
+        # averages must skip NULLs rather than trust SQL AVG over mixed rows.)
+        rows = (
+            db.query(
+                ResumeResult.user_id,
+                ResumeResult.status,
+                ResumeResult.jd_match_score,
+                ResumeResult.updated_at,
+            )
+            .all()
+        )
+        agg: dict = {}
+        for uid, status, score, updated in rows:
+            if uid is None:
+                continue
+            a = agg.setdefault(uid, {"jobs": 0, "completed": 0, "failed": 0,
+                                     "scores": [], "last_active": None})
+            a["jobs"] += 1
+            st_key = status.value if hasattr(status, "value") else str(status)
+            if st_key in ("completed", "failed"):
+                a[st_key] += 1
+            if score is not None:
+                a["scores"].append(score)
+            if updated is not None and (a["last_active"] is None or updated > a["last_active"]):
+                a["last_active"] = updated
+
         out = []
         for u in users:
-            jobs = db.query(ResumeResult).filter(ResumeResult.user_id == u.id).all()
-            j_count = len(jobs)
-            completed_scores = [j.jd_match_score for j in jobs if j.jd_match_score is not None]
-            avg_s = sum(completed_scores) / len(completed_scores) if completed_scores else None
+            a = agg.get(u.id, {"jobs": 0, "completed": 0, "failed": 0,
+                               "scores": [], "last_active": None})
+            avg_s = (sum(a["scores"]) / len(a["scores"])) if a["scores"] else None
+            la = a["last_active"]
             out.append({
                 "id": u.id,
                 "username": u.username,
                 "email": u.email,
                 "is_admin": bool(u.is_admin),
-                "jobs": j_count,
+                "jobs": a["jobs"],
+                "completed": a["completed"],
+                "failed": a["failed"],
                 "avg_score": round(avg_s, 1) if avg_s is not None else None,
                 "created_at": u.created_at.isoformat() if u.created_at else None,
+                "last_active": la.isoformat() if la else None,
             })
         return {"total": len(out), "users": out}
     finally:
@@ -495,12 +588,17 @@ def admin_trends(days: int = 30, x_user_token: str | None = Header(default=None)
             for k, v in sorted(skill_counts.items(), key=lambda x: x[1], reverse=True)[:15]
         ]
 
+        trend_scores = [
+            j.jd_match_score for j in jobs if j.jd_match_score is not None
+        ]
+
         return {
             "window_days": days,
             "jobs_per_day": jobs_per_day,
             "signups_per_day": signups_per_day,
             "profession_distribution": prof_dist,
             "skill_distribution": top_skills,
+            "score_histogram": _score_histogram(trend_scores),
         }
     finally:
         db.close()

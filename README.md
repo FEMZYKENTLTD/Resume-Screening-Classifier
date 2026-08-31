@@ -63,14 +63,19 @@ matched keywords, skill cloud, trend charts and one-click CSV/PDF reports.
 Under the hood it's an **enterprise-style async architecture**, not a notebook script:
 
 ```
-Streamlit UI  ──POST /single_analyze──▶  FastAPI  ──enqueue──▶  Redis ──▶ Celery worker
-     ▲                                                                    │ parse → extract (NER)
-     │                                                                    │ → classify (ML) → score
-     └──────── GET /results/{job_id}  ◀──  PostgreSQL  ◀──persist─────────┘
+Streamlit UI  ──POST /single_analyze──▶  FastAPI  ──▶ parse → extract (NER)
+     ▲                                         │      → classify (ML) → score
+     │                                         ▼
+     └── GET /results/{job_id}  ◀──  PostgreSQL  ◀──persist── completed result
+                                     ▲
+        Redis ──▶ Celery worker ─────┘  (optional async lane — tasks.py,
+                                         Dockerfile.worker / Dockerfile.worker.ml)
 ```
 
-- ⚡ Requests return in **~50 ms** (`202 Accepted + job_id`) — heavy lifting happens in workers
-- 🧵 Workers scale horizontally: `celery worker --concurrency=N`
+- ⚡ The API runs the whole pipeline **synchronously** (`POST /single_analyze` returns the
+  completed result in one round-trip) — instant feedback for interactive screening
+- 🧵 Need higher throughput? An **async Celery lane** ships too: `tasks.py` + Redis +
+  `celery worker --concurrency=N` scales horizontally behind the same API contract
 - 🗄️ Schema is **Alembic-managed** (single linear head, auto-applied on deploy)
 - 📊 Every request/job emits **Prometheus metrics**, charted by a provisioned Grafana board
 
@@ -109,7 +114,7 @@ Streamlit UI  ──POST /single_analyze──▶  FastAPI  ──enqueue──�
 | 🐳 **One-command stack** | `docker compose up` → db, redis, api, worker, streamlit, prometheus, grafana |
 | 🔄 **Auto-migrations** | `alembic upgrade head` runs on container start / Fly release command |
 | 📈 **Observability** | `/metrics` on API **and** worker; Grafana dashboard provisioned out-of-the-box |
-| ✅ **CI/CD** | compile-check → 31 tests → migration-check → deploy (Fly.io API+worker, Render UI) |
+| ✅ **CI/CD** | compile-check → test suite → migration-check → deploy (Fly.io API+worker, Render UI) |
 
 ### 💜 UI/UX — "Aurora" *(new in v5.5)*
 - 🌈 **Animated aurora background** — four drifting, blurred gradient orbs (indigo / fuchsia / cyan / blue)
@@ -173,9 +178,9 @@ Streamlit UI  ──POST /single_analyze──▶  FastAPI  ──enqueue──�
 **Request lifecycle:**
 
 1. HR uploads resumes in the **Streamlit** app → `POST /single_analyze` (multipart)
-2. **FastAPI** validates auth, hashes `(file, JD)` for duplicate short-circuit, enqueues a Celery task → returns `202 { job_id }`
-3. **Celery worker** picks the job: parse (PDF/DOCX) → extract fields (NER) → classify role (ML) → score → persist to **Postgres**
-4. UI polls `GET /results/{job_id}`: `queued → processing → completed/failed`
+2. **FastAPI** validates auth, hashes `(file, JD)` for duplicate short-circuit, then runs the pipeline **inline**: parse (PDF/DOCX) → extract fields (NER) → classify role (ML) → score → persist to **Postgres** → returns the completed result
+3. Deployments that prefer the async lane run the identical pipeline in a **Celery worker** (`tasks.py`) behind Redis — same schema, same scoring
+4. `GET /results/{job_id}` returns any job's state: `queued → processing → completed/failed`
 5. Dashboards (`/analytics/summary`, `/admin/*`, `/history`) aggregate everything in real time
 
 ---
@@ -326,7 +331,7 @@ tech-stack mix, score histogram — plus a **401/403 security gate** (machine-ve
 | `GET` | `/health` | — | liveness probe |
 | `POST` | `/auth/signup` | — | create account → `{ token }` |
 | `POST` | `/auth/login` | — | `{ username, password }` → `{ token, is_admin }` |
-| `POST` | `/single_analyze` | optional | multipart resume + JD → `202 { job_id }` (dedup-aware) |
+| `POST` | `/single_analyze` | optional | multipart resume + JD → `200` completed result (dedup-aware) |
 | `GET` | `/results/{job_id}` | — | job status → score, role, fields, skills |
 | `GET` | `/history` | 🔒 | caller's analyses |
 | `GET` | `/analytics/summary` | — | distributions, histograms, recent jobs |
@@ -345,17 +350,20 @@ Interactive docs: **`/docs`** on the API (Swagger UI).
 Everything claimed above is **machine-verified**, not vibes:
 
 ```bash
-pytest tests/ -q                     # 31 passed — full stack on SQLite + eager Celery
+pytest tests/ -q                     # 31 tests — full stack on SQLite + eager Celery
+                                     #   • with the optional ML extras installed: 31 passed
+                                     #   • with scikit-learn only: 30 passed, 1 spaCy-model skip
+                                     #   • bare CI (no ML extras): 28 passed, 3 auto-skips
 python scripts/verify_ui_live.py     # 21 passed — drives the REAL running stack:
-                                     # HTTP login → PDF through the queue → AppTest on every page
+                                     # HTTP login → PDF through the pipeline → AppTest on every page
 ```
 
 `verify_ui_live.py` performs true end-to-end round-trips: real logins (admin + non-admin),
-a generated PDF pushed through `single_analyze → Celery worker → DB → results`, then
+a generated PDF pushed through `single_analyze → pipeline → DB → results`, then
 `streamlit.testing.AppTest` renders **every page** (login, screening, analytics, history,
 admin incl. 401/403 gating) and asserts zero exceptions.
 
-CI runs the same gates on every push: **compile → migrate-check → 31 tests → deploy**.
+CI runs the same gates on every push: **compile → migrate-check → test suite → deploy**.
 
 ---
 
@@ -388,6 +396,25 @@ CI runs the same gates on every push: **compile → migrate-check → 31 tests �
   with a provisioned *ResumeRank Overview* dashboard — zero clicks to graphs
 
 ---
+
+## 🆕 What's new in v5.6
+
+- 🔧 **CI repair** — the `verify` workflow had rotted: `api_server.py` imported
+  `auth.BaseModel` (pydantic lives in `api_server`, not `auth`), called three
+  `monitoring` helpers that no longer existed (`init_metrics`, `generate_metrics`,
+  `record_request`), and signup validation was missing entirely. All fixed; the
+  **Prometheus middleware** (per-route request counters + latency) was rebuilt to match.
+- 📊 **Dashboard API contract restored** — `/analytics/summary` and `/admin/trends`
+  expose `score_histogram` again; `/admin/overview` returns `by_status`,
+  `jobs_last_7d`, `avg_match_score`; `/admin/users` now includes per-user
+  `completed` / `failed` / `last_active` (single-scan aggregation, N+1 removed).
+  The Analytics + Admin pages render exception-free again — **live E2E 21/21**.
+- 🛡 **Signup policy** — username ≥ 3 chars, password ≥ 8 chars, 422 on violation;
+  login stays lenient so wrong-password attempts still surface as 401.
+- ⬆️ **GitHub Actions modernized** — `actions/checkout@v7`, `actions/setup-python@v7`
+  (Node 24 runtime; Node 20 leaves the runners on 2026-09-16), flyctl action pinned
+  to `@v1` instead of a floating `@master`.
+- 📜 README updated to match reality (synchronous API contract, honest test counts).
 
 ## 🆕 What's new in v5.5
 
