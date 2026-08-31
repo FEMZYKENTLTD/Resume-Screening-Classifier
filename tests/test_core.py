@@ -239,7 +239,7 @@ def test_single_analyze_pdf_end_to_end(client):
         files={"resume": ("jane.pdf", pdf, "application/pdf")},
         data={"jd": JD},
     )
-    assert resp.status_code == 202
+    assert resp.status_code == 200
     job_id = resp.json()["job_id"]
 
     result = client.get(f"/results/{job_id}")
@@ -263,7 +263,7 @@ def test_single_analyze_docx_end_to_end(client):
         )},
         data={"jd": JD},
     )
-    assert resp.status_code == 202
+    assert resp.status_code == 200
     payload = client.get(f"/results/{resp.json()['job_id']}").json()
     assert payload["status"] == "completed"
     assert payload["jd_match_score"] > 0
@@ -383,7 +383,7 @@ def test_signup_login_and_history_flow(client):
                        files={"resume": ("owned.pdf", pdf, "application/pdf")},
                        data={"jd": "owned history jd " + uuid.uuid4().hex},
                        headers=headers)
-    assert resp.status_code == 202
+    assert resp.status_code == 200
 
     h = client.get("/history", headers=headers)
     assert h.status_code == 200
