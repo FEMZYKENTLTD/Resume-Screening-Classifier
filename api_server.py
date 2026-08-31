@@ -86,7 +86,7 @@ def startup_event():
     monitoring.init_metrics()
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok"}
 
