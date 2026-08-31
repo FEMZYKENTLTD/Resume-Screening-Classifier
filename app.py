@@ -1139,7 +1139,7 @@ def extract_text(file) -> str:
 
 
 def analyze_via_api(file, jd: str):
-    """Submit to FastAPI -> Celery worker, poll until done."""
+    """Submit to FastAPI -> Synchronous direct processing, returns completed result instantly."""
     file.seek(0)
     raw = file.read()
     ext = os.path.splitext(file.name)[1].lower()
@@ -1150,29 +1150,11 @@ def analyze_via_api(file, jd: str):
         files={"resume": (file.name, raw, mime)},
         data={"jd": jd},
         headers=api_headers(),
-        timeout=30,
+        timeout=60,
     )
     resp.raise_for_status()
-    submitted = resp.json()
-
-    if submitted.get("duplicate") and submitted.get("status") == "completed":
-        details = requests.get(f"{API_URL}/results/{submitted['job_id']}", timeout=10)
-        payload = details.json() if details.ok else submitted
-        payload["duplicate"] = True
-        return payload, None
-
-    job_id = submitted["job_id"]
-    deadline = time.time() + POLL_TIMEOUT_S
-    while time.time() < deadline:
-        r = requests.get(f"{API_URL}/results/{job_id}", timeout=10)
-        if r.ok:
-            payload = r.json()
-            if payload["status"] == "completed":
-                return payload, None
-            if payload["status"] == "failed":
-                return None, "worker reported failure"
-        time.sleep(POLL_INTERVAL_S)
-    return None, "timed out waiting for worker"
+    payload = resp.json()
+    return payload, None
 
 
 if run_clicked and ready:

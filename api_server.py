@@ -1,19 +1,16 @@
 """
-FastAPI entrypoint for the Resume Screening Classifier.
+FastAPI entrypoint for the Resume Screening Classifier (Synchronous Direct Processing Mode).
 
 Endpoints:
   GET  /health             -> liveness probe
   GET  /metrics            -> Prometheus scrape target
   POST /auth/signup        -> create an account (bcrypt), returns token
-  POST /auth/login         -> returns token
-  POST /single_analyze     -> queue a resume (PDF/DOCX); optional X-User-Token
-  GET  /results/{job_id}   -> poll status / score / role / extracted fields
+  POST /auth/login         -> returns token (case-insensitive username, synced is_admin)
+  POST /single_analyze     -> SYNCHRONOUS parse, score, extract, and persist (blazing fast, no worker needed)
+  GET  /results/{job_id}   -> get results directly
   GET  /history            -> the calling user's past analyses (X-User-Token)
   GET  /analytics/summary  -> recruiter analytics (aggregate)
-
-Duplicate prevention: same resume content + same JD returns the original
-analysis (`duplicate: true`). Every job is optionally attributed to a user,
-enabling account history.
+  GET  /admin/*            -> admin dashboards (RBAC gated)
 """
 
 import base64
@@ -32,15 +29,17 @@ import auth
 import monitoring
 import parsing
 from database import SessionLocal
+from extractors import extract_fields
 from models import JobStatus, ResumeResult, User
-from tasks import analyze_resume_task, make_dedup_hash
+from roles import classify_role_with_method
+from scoring import overlap_score
+from skills import extract_skills
+from tasks import make_dedup_hash
 
-app = FastAPI(title="Resume Classifier API", version="5.1.0")
+app = FastAPI(title="Resume Classifier API (Sync)", version="5.2.0")
 
 MAX_RESUME_BYTES = 10 * 1024 * 1024  # 10 MB safety cap
 
-# Admin access: usernames in this set become/remain admins. Manage via env
-# (ADMIN_USERNAMES="admin,femi") — or flip users.is_admin in the DB directly.
 ADMIN_USERNAMES = {
     u.strip().lower()
     for u in os.environ.get("ADMIN_USERNAMES", "admin").split(",")
@@ -78,7 +77,6 @@ def metrics():
 
 
 def _current_user_id(x_user_token: str | None) -> int | None:
-    """Resolve a user_id from the token header; None if absent/invalid."""
     if not x_user_token:
         return None
     return auth.verify_token(x_user_token)
@@ -92,7 +90,6 @@ def _require_user_id(x_user_token: str | None) -> int:
 
 
 def _require_admin(x_user_token: str | None) -> int:
-    """Resolve the calling user and require admin rights; 401/403 otherwise."""
     user_id = _require_user_id(x_user_token)
     db = SessionLocal()
     try:
@@ -116,7 +113,7 @@ class SignupRequest(Credentials):
 
 
 def _is_admin_name(username: str) -> bool:
-    return (username or "").lower() in ADMIN_USERNAMES
+    return (username or "").strip().lower() in ADMIN_USERNAMES
 
 
 def _user_payload(user: User) -> dict:
@@ -133,7 +130,8 @@ def signup(payload: SignupRequest):
     db = SessionLocal()
     try:
         clash = db.query(User).filter(
-            (User.username == payload.username) | (User.email == payload.email)
+            (func.lower(User.username) == payload.username.strip().lower()) | 
+            (func.lower(User.email) == payload.email.strip().lower())
         ).first()
         if clash:
             raise HTTPException(
@@ -141,8 +139,8 @@ def signup(payload: SignupRequest):
                 detail="Username or email already registered",
             )
         user = User(
-            username=payload.username,
-            email=payload.email,
+            username=payload.username.strip(),
+            email=payload.email.strip(),
             password_hash=auth.hash_password(payload.password),
             is_admin=_is_admin_name(payload.username),
         )
@@ -158,12 +156,14 @@ def signup(payload: SignupRequest):
 def login(payload: Credentials):
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.username == payload.username).first()
+        user = db.query(User).filter(
+            func.lower(User.username) == payload.username.strip().lower()
+        ).first()
         if user is None or not auth.verify_password(
             payload.password, user.password_hash or ""
         ):
             raise HTTPException(status_code=401, detail="Invalid username or password")
-        # keep the flag in sync if ADMIN_USERNAMES changed since last login
+        
         should_be = _is_admin_name(user.username)
         if bool(user.is_admin) != should_be:
             user.is_admin = should_be
@@ -173,21 +173,24 @@ def login(payload: Credentials):
         db.close()
 
 
-# ------------------------------- analysis --------------------------------
+# ------------------------------- analysis (SYNCHRONOUS DIRECT) --------------------------------
 
-@app.post("/single_analyze", status_code=202)
+@app.post("/single_analyze", status_code=200)
 async def single_analyze(
     resume: UploadFile = File(...),
     jd: str = Form(...),
     x_user_token: str | None = Header(default=None),
 ):
+    """
+    Synchronously parses the resume, runs scoring, extraction, and role classification,
+    saves directly to PostgreSQL/Supabase, and returns completed results instantly.
+    """
     filename = resume.filename or "resume.pdf"
     ext = os.path.splitext(filename)[1].lower()
     if ext not in parsing.SUPPORTED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type '{ext}'. "
-                   f"Supported: {', '.join(parsing.SUPPORTED_EXTENSIONS)}",
+            detail=f"Unsupported file type '{ext}'. Supported: {', '.join(parsing.SUPPORTED_EXTENSIONS)}",
         )
 
     payload = await resume.read()
@@ -196,38 +199,88 @@ async def single_analyze(
     if len(payload) > MAX_RESUME_BYTES:
         raise HTTPException(status_code=413, detail="Resume exceeds 10 MB limit.")
 
-    if x_user_token is not None:
-        user_id = _require_user_id(x_user_token)
-    else:
-        user_id = None
-
+    user_id = _current_user_id(x_user_token) if x_user_token else None
     dedup_hash = make_dedup_hash(payload, jd)
+
     db = SessionLocal()
     try:
+        # Check duplicate
         existing = db.query(ResumeResult).filter(
             ResumeResult.resume_hash == dedup_hash
         ).first()
-        if existing is not None:
-            if existing.status != JobStatus.FAILED:
-                return {
-                    "job_id": existing.job_id,
-                    "status": existing.status.value,
-                    "jd_match_score": existing.jd_match_score,
-                    "duplicate": True,
-                }
-            db.delete(existing)
-            db.commit()
+
+        if existing is not None and existing.status == JobStatus.COMPLETED:
+            if user_id and not existing.user_id:
+                existing.user_id = user_id
+                db.commit()
+            return {
+                "job_id": existing.job_id,
+                "status": "completed",
+                "jd_match_score": existing.jd_match_score,
+                "skills_extracted": existing.skills_extracted,
+                "predicted_role": existing.predicted_role,
+                "extracted_fields": json.loads(existing.extracted_fields) if existing.extracted_fields else {},
+                "match_details": json.loads(existing.match_details) if existing.match_details else {},
+                "duplicate": True,
+            }
+
+        # Perform parsing & ML analysis synchronously right now
+        text = parsing.parse_resume(filename, payload)
+        keyword_score, _overlap = overlap_score(text, jd)
+        role, role_method, role_confidence = classify_role_with_method(text)
+        extracted = extract_fields(text)
+        skills = ", ".join(sorted(extract_skills(text)))
+
+        details = {
+            "algorithm": "keyword-overlap",
+            "keyword_score": keyword_score,
+            "role_method": role_method,
+            "role_confidence": role_confidence,
+        }
+
+        job_id = existing.job_id if existing else str(uuid.uuid4())
+        
+        if existing:
+            job = existing
+            job.status = JobStatus.PROCESSING
+        else:
+            job = ResumeResult(
+                job_id=job_id,
+                filename=filename,
+                job_description=jd,
+                resume_hash=dedup_hash,
+                user_id=user_id,
+                status=JobStatus.PROCESSING,
+            )
+            db.add(job)
+        db.commit()
+
+        job.resume_text = text
+        job.jd_match_score = keyword_score
+        job.skills_extracted = skills
+        job.predicted_role = role
+        job.extracted_fields = json.dumps(extracted)
+        job.match_details = json.dumps(details)
+        job.status = JobStatus.COMPLETED
+        if user_id:
+            job.user_id = user_id
+        db.commit()
+
+        return {
+            "job_id": job_id,
+            "status": "completed",
+            "jd_match_score": keyword_score,
+            "skills_extracted": skills,
+            "predicted_role": role,
+            "extracted_fields": extracted,
+            "match_details": details,
+            "duplicate": False,
+        }
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(exc)}")
     finally:
         db.close()
-
-    job_id = str(uuid.uuid4())
-    # user_id travels inside the task message and is written atomically
-    # with the job row — no read-modify-write race.
-    analyze_resume_task.delay(
-        base64.b64encode(payload).decode("ascii"), filename, jd, job_id, user_id
-    )
-
-    return {"job_id": job_id, "status": "queued", "duplicate": False}
 
 
 @app.get("/results/{job_id}")
@@ -265,7 +318,6 @@ def get_results(job_id: str):
 
 @app.get("/history")
 def history(x_user_token: str | None = Header(default=None)):
-    """The signed-in user's past analyses (newest first, cap 200)."""
     user_id = _require_user_id(x_user_token)
     db = SessionLocal()
     try:
@@ -301,7 +353,6 @@ def history(x_user_token: str | None = Header(default=None)):
 
 @app.get("/analytics/summary")
 def analytics_summary():
-    """Aggregated recruiter analytics across all processed jobs."""
     db = SessionLocal()
     try:
         rows = db.query(ResumeResult).all()
@@ -360,7 +411,6 @@ def _day(d) -> str:
 
 @app.get("/admin/overview")
 def admin_overview(x_user_token: str | None = Header(default=None)):
-    """Admin dashboard KPIs."""
     _require_admin(x_user_token)
     db = SessionLocal()
     try:
@@ -387,7 +437,6 @@ def admin_overview(x_user_token: str | None = Header(default=None)):
 
 @app.get("/admin/users")
 def admin_users(x_user_token: str | None = Header(default=None)):
-    """All registered users with per-user activity aggregates."""
     _require_admin(x_user_token)
     db = SessionLocal()
     try:
@@ -441,7 +490,6 @@ def admin_users(x_user_token: str | None = Header(default=None)):
 
 @app.get("/admin/users/{uid}/jobs")
 def admin_user_jobs(uid: int, x_user_token: str | None = Header(default=None)):
-    """Drill-down: one user's full analysis history (admin)."""
     _require_admin(x_user_token)
     db = SessionLocal()
     try:
@@ -475,8 +523,6 @@ def admin_user_jobs(uid: int, x_user_token: str | None = Header(default=None)):
 
 @app.get("/admin/trends")
 def admin_trends(days: int = 30, x_user_token: str | None = Header(default=None)):
-    """Trend analytics: jobs/day, signups/day, profession & stack
-    distributions, score histogram."""
     _require_admin(x_user_token)
     days = max(1, min(days, 365))
     cutoff = dt.datetime.utcnow() - dt.timedelta(days=days)
