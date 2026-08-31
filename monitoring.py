@@ -67,6 +67,31 @@ def metrics_response():
     return generate_latest(registry), CONTENT_TYPE_LATEST
 
 
+def init_metrics() -> None:
+    """Called by the API on startup: pre-register label children so every
+    series is present from the first scrape (Prometheus only serializes
+    counters that have been touched)."""
+    if not _OK:                                # pragma: no cover
+        return
+    for _status in ("completed", "failed"):
+        resume_tasks_total.labels(status=_status)
+    resume_last_match_score.set(0)
+
+
+def record_request(path: str, method: str = "GET", status: int = 200,
+                   seconds: float | None = None) -> None:
+    """Record one API request. Used by the middleware in api_server.py;
+    `path` should be the route template (e.g. /results/{job_id}) to keep
+    label cardinality bounded."""
+    if not _OK:                                # pragma: no cover
+        return
+    http_requests_total.labels(
+        method=method, path=path, status=str(status)
+    ).inc()
+    if seconds is not None:
+        http_request_seconds.labels(method=method, path=path).observe(seconds)
+
+
 def task_finished(status: str, seconds: float, score=None):
     if not _OK:
         return
