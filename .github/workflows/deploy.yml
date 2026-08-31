@@ -32,8 +32,8 @@ jobs:
         env:
           DATABASE_URL: sqlite:////tmp/ci_migrations.db
         run: |
-          test "$(alembic heads | grep -c head)" -eq 1
-          alembic upgrade head
+          test "$(python -m alembic heads | grep -c head)" -eq 1
+          python -m alembic upgrade head
 
   deploy-api:
     needs: verify
