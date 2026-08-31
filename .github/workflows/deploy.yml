@@ -1,3 +1,18 @@
+# ============================================================
+# REFERENCE COPY — apply with:
+#   cp docs/deploy.yml.node24 .github/workflows/deploy.yml
+#   git add .github/workflows/deploy.yml && git commit -m "CI: Node 24 actions"
+#
+# Why: actions/checkout@v4 + setup-python@v5 run on Node.js 20, which
+# GitHub removes from Actions runners on 2026-09-16 (forced Node 24 since
+# June 2026). This copy bumps checkout to v7 and setup-python to v7 and
+# pins flyctl-actions/setup-flyctl to the v1 tag instead of @master.
+# It lives outside .github/workflows/ because the Arena GitHub App token
+# lacks the 'workflows' permission and cannot push workflow edits.
+# Behavior for this repo is unchanged: we use push/pull_request events
+# and only the python-version input (v7's breaking changes touch
+# pull_request_target safety and the removed pip-install input).
+# ============================================================
 name: Verify & Deploy Full Stack
 
 on:
@@ -14,8 +29,8 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install dependencies
@@ -39,8 +54,8 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - uses: actions/checkout@v7
+      - uses: superfly/flyctl-actions/setup-flyctl@v1
       - name: Sync secrets from GitHub into the Fly app
         run: |
           flyctl secrets set \
@@ -64,8 +79,8 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - uses: actions/checkout@v7
+      - uses: superfly/flyctl-actions/setup-flyctl@v1
       - name: Sync secrets from GitHub into the Fly app
         run: |
           flyctl secrets set \
@@ -86,7 +101,7 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Trigger Render Deploy
         run: |
           curl -X POST \
