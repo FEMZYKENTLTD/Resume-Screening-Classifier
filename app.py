@@ -571,6 +571,37 @@ def api_headers() -> dict:
 def _flash(message: str, icon: str = "✨") -> None:
     st.session_state._flash = (message, icon)
 
+# ---------------- REFRESH PERSISTENCE (cookie-backed session) ----------------
+# Streamlit wipes st.session_state on every page refresh, which used to log
+# users out. The token itself is already signed + expiring (itsdangerous,
+# TOKEN_MAX_AGE_DAYS), so it is safe to remember in a browser cookie and
+# re-validate against the API when a fresh session starts.
+
+SESSION_COOKIE = "rr_session"
+
+
+def _read_session_cookie() -> str | None:
+    try:
+        return st.context.cookies.get(SESSION_COOKIE)
+    except Exception:
+        return None  # no browser context (tests / bare mode)
+
+
+def _write_session_cookie(token: str | None) -> None:
+    """Set (or, with None, expire) the session cookie. Streamlit has no
+    native cookie-write API, so a zero-height same-origin iframe asks the
+    browser directly. SameSite=Lax; scoped to this app only."""
+    if token:
+        pair = f"{SESSION_COOKIE}={token}; max-age={7 * 24 * 3600}; path=/; SameSite=Lax"
+    else:
+        pair = f"{SESSION_COOKIE}=; max-age=0; path=/; SameSite=Lax"
+    try:
+        components.html(
+            "<script>document.cookie = " + json.dumps(pair) + ";</script>",
+            height=0,
+        )
+    except Exception:
+        pass  # cookie persistence is a nicety, never a crash
 
 def _do_login(username: str, password: str) -> str | None:
     try:
@@ -609,6 +640,29 @@ def _do_signup(username: str, email: str, password: str) -> str | None:
     except ValueError:
         return f"Signup failed ({resp.status_code})"
 
+# ---------------- REFRESH: restore session from cookie ----------------
+if USING_API and not st.session_state.token:
+    remembered = _read_session_cookie()
+    if remembered:
+        try:
+            me = requests.get(
+                f"{API_URL}/auth/me",
+                headers={"X-User-Token": remembered}, timeout=5,
+            )
+        except requests.RequestException:
+            me = None
+        if me is not None and me.ok:
+            data = me.json()
+            st.session_state.token = remembered
+            st.session_state.username = data["username"]
+            st.session_state.is_admin = bool(data.get("is_admin"))
+        else:
+            _write_session_cookie(None)  # expired/invalid — drop it
+
+# Keep the cookie fresh on every logged-in run (idempotent; also covers the
+# rerun right after login/signup, which replaces the login form element).
+if USING_API and st.session_state.token:
+    _write_session_cookie(st.session_state.token)
 
 # ---------------- LOGIN / SIGNUP (API mode) ----------------
 if USING_API and not st.session_state.token:
@@ -668,22 +722,27 @@ if USING_API and not st.session_state.token:
 # ---------------- LEGACY LOGIN (API offline) ----------------
 if not USING_API:
     import streamlit_authenticator as stauth
+    from streamlit_authenticator.utilities.hasher import Hasher
 
     names = ["HR Manager", "Recruiter"]
     usernames = [os.environ.get("HR_USERNAME", "hr"),
                  os.environ.get("RECRUITER_USERNAME", "recruiter")]
     passwords = [os.environ.get("HR_PASSWORD", "password123"),
                  os.environ.get("RECRUITER_PASSWORD", "securepass")]
-    hashed = stauth.Hasher(passwords).generate()
+    hashed = Hasher(passwords).generate()
+    # streamlit-authenticator 0.3.x API: credentials dict + 4-arg constructor.
+    credentials = {"usernames": {
+        u: {"name": n, "password": p}
+        for u, n, p in zip(usernames, names, hashed)
+    }}
     authenticator = stauth.Authenticate(
-        names, usernames, hashed, "resume_dashboard",
+        credentials, "resume_dashboard",
         os.environ.get("COOKIE_KEY", "abcdef"), cookie_expiry_days=30,
     )
-    name, auth_status, _u = authenticator.login("Login", "main")
+    name, auth_status, _u = authenticator.login("main")
     if not auth_status:
         st.stop()
     st.session_state.username = name
-    st.session_state.is_admin = False
 
 # ---------------- SIDEBAR ----------------
 initial = (st.session_state.username or "?")[0].upper()
@@ -715,6 +774,8 @@ if st.session_state.token and st.sidebar.button("🚪 Log out", width="stretch")
     st.session_state.username = None
     st.session_state.is_admin = False
     st.session_state.screen = None
+    if USING_API:
+        _write_session_cookie(None)  # forget the remembered session
     st.rerun()
 
 st.sidebar.markdown(

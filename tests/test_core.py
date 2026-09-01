@@ -327,6 +327,8 @@ def test_analytics_summary(client):
     assert 0 < body["avg_match_score"] <= 100
     assert isinstance(body["role_distribution"], dict)
     assert isinstance(body["top_skills"], list)
+    # UI contract (app.py analytics page) — pins against silent drift
+    assert isinstance(body["score_histogram"], dict) and body["score_histogram"]
     assert body["recent_jobs"], "recent jobs should list processed work"
     assert {"job_id", "filename", "status"} <= set(body["recent_jobs"][0])
 
@@ -451,12 +453,16 @@ def test_admin_full_flow(client):
     assert ov.status_code == 200
     assert ov.json()["total_users"] >= 2
     assert ov.json()["total_jobs"] >= 1
+    # UI contract (app.py admin page KPI strip) — pins against silent drift
+    assert {"by_status", "jobs_last_7d", "avg_match_score"} <= set(ov.json())
 
     users = client.get("/admin/users", headers=h).json()
     names = {u["username"] for u in users["users"]}
     assert f"worker{suffix}" in names
     w = next(u for u in users["users"] if u["username"] == f"worker{suffix}")
     assert w["jobs"] >= 1 and w["avg_score"] is not None
+    # registry-table columns the UI renders — pins against silent drift
+    assert {"completed", "failed", "last_active"} <= set(w)
 
     drill = client.get(f"/admin/users/{w['id']}/jobs", headers=h)
     assert drill.status_code == 200
@@ -480,5 +486,68 @@ def test_rejects_non_pdf(client):
     assert resp.status_code == 400
 
 
+def test_corrupt_pdf_returns_400(client):
+    """A broken/encrypted PDF is a client error (400), not a server crash
+    (500) — regression for the FileDataError path."""
+    resp = client.post(
+        "/single_analyze",
+        files={"resume": ("corrupt.pdf", b"%PDF-1.4 this is not a real pdf", "application/pdf")},
+        data={"jd": JD},
+    )
+    assert resp.status_code == 400
+
+
+def test_empty_pdf_returns_400(client):
+    resp = client.post(
+        "/single_analyze",
+        files={"resume": ("blank.pdf", _sample_pdf("   \n  "), "application/pdf")},
+        data={"jd": JD},
+    )
+    assert resp.status_code == 400
+
+
 def test_unknown_job_is_404(client):
     assert client.get(f"/results/{uuid.uuid4()}").status_code == 404
+
+
+# ---------------- legacy offline login (API down fallback) ----------------
+
+def test_legacy_offline_login_renders(client):
+    """When the API is unreachable, app.py falls back to the legacy
+    streamlit-authenticator login — it must render without exceptions
+    (regression: 0.3.x moved Hasher and changed Authenticate's signature)."""
+    from streamlit.testing.v1 import AppTest
+
+    app_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py"
+    )
+    old_url = os.environ.get("API_URL")
+    os.environ["API_URL"] = "http://127.0.0.1:9"  # closed port -> USING_API False
+    try:
+        at = AppTest.from_file(app_path, default_timeout=60)
+        at.run()
+        assert not at.exception, f"legacy login crashed: {[e.value for e in at.exception]}"
+        assert at.button or at.text_input, "legacy login form should render"
+    finally:
+        if old_url is None:
+            os.environ.pop("API_URL", None)
+        else:
+            os.environ["API_URL"] = old_url
+            
+# ---------------- refresh persistence (/auth/me) ----------------
+
+def test_auth_me_roundtrip(client):
+    """/auth/me validates a remembered token — the refresh-persistence
+    (cookie restore) path in app.py depends on this contract."""
+    suffix = uuid.uuid4().hex[:8]
+    tok = _token_for(client, f"me{suffix}", f"me{suffix}@e.co")
+    h = {"X-User-Token": tok}
+    r = client.get("/auth/me", headers=h)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["username"] == f"me{suffix}"
+    assert body["is_admin"] is False
+    assert body["email"] == f"me{suffix}@e.co"
+    # anonymous / bogus tokens are rejected
+    assert client.get("/auth/me").status_code == 401
+    assert client.get("/auth/me", headers={"X-User-Token": "bogus"}).status_code == 401

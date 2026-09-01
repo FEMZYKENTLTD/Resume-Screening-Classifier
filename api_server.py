@@ -49,7 +49,12 @@ ADMIN_USERNAMES = {
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Lock down in production with CORS_ALLOW_ORIGINS=https://your-ui.example.com
+    # (comma-separated). Default "*" keeps today's permissive demo behaviour.
+    allow_origins=[
+        o.strip() for o in os.environ.get("CORS_ALLOW_ORIGINS", "*").split(",")
+        if o.strip()
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -86,7 +91,7 @@ def startup_event():
     monitoring.init_metrics()
 
 
-@app.api_route("/health", methods=["GET", "HEAD"])
+@app.get("/health")
 def health():
     return {"status": "ok"}
 
@@ -198,6 +203,24 @@ def login(payload: Credentials):
     finally:
         db.close()
 
+@app.get("/auth/me")
+def auth_me(x_user_token: str | None = Header(default=None)):
+    """Validate a session token and return its user — lets the UI restore
+    a login from a remembered cookie after a page refresh."""
+    user_id = _require_user_id(x_user_token)
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="Unknown user")
+        return {
+            "user_id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "is_admin": bool(user.is_admin),
+        }
+    finally:
+        db.close()
 
 # ------------------------------- analysis (SYNCHRONOUS DIRECT) --------------------------------
 
@@ -248,7 +271,23 @@ async def single_analyze(
                 "duplicate": True,
             }
 
-        text = parsing.parse_resume(filename, payload)
+        try:
+            text = parsing.parse_resume(filename, payload)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            # corrupt/encrypted/unreadable files are a client problem, not a
+            # server fault — surface as 400, keep genuine crashes as 500
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not parse '{filename}': {exc}",
+            )
+        if not text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"No readable text in '{filename}'. Scanned image PDFs "
+                       "need OCR before upload.",
+            )
         keyword_score, _overlap = overlap_score(text, jd)
         role, role_method, role_confidence = classify_role_with_method(text)
         extracted = extract_fields(text)
@@ -299,6 +338,10 @@ async def single_analyze(
             "match_details": details,
             "duplicate": False,
         }
+    except HTTPException:
+        # client errors (400 bad file, etc.) must not be rewritten to 500
+        db.rollback()
+        raise
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(exc)}")
@@ -417,6 +460,12 @@ def analytics_summary():
         db.close()
 
 
+def _utcnow() -> dt.datetime:
+    """Naive UTC now — datetime.utcnow() is deprecated on Python 3.12+;
+    the DB stores naive UTC, so we drop tzinfo after conversion."""
+    return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+
 def _day(d) -> str:
     return d.strftime("%Y-%m-%d") if d else "unknown"
 
@@ -451,7 +500,7 @@ def admin_overview(x_user_token: str | None = Header(default=None)):
             key = value.value if hasattr(value, "value") else str(value)
             by_status[key] = count
 
-        week_ago = dt.datetime.utcnow() - dt.timedelta(days=7)
+        week_ago = _utcnow() - dt.timedelta(days=7)
         jobs_last_7d = (
             db.query(ResumeResult)
             .filter(ResumeResult.created_at >= week_ago)
@@ -535,7 +584,11 @@ def admin_user_jobs(uid: int, x_user_token: str | None = Header(default=None)):
         user = db.query(User).filter(User.id == uid).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        jobs = db.query(ResumeResult).filter(ResumeResult.user_id == uid).order_by(ResumeResult.created_at.desc()).all()
+        jobs = (db.query(ResumeResult)
+                 .filter(ResumeResult.user_id == uid)
+                 .order_by(ResumeResult.created_at.desc())
+                 .limit(200)
+                 .all())
         return {
             "user": {"id": user.id, "username": user.username, "email": user.email},
             "jobs": [
@@ -558,7 +611,7 @@ def admin_user_jobs(uid: int, x_user_token: str | None = Header(default=None)):
 def admin_trends(days: int = 30, x_user_token: str | None = Header(default=None)):
     _require_admin(x_user_token)
     days = max(1, min(days, 365))
-    cutoff = dt.datetime.utcnow() - dt.timedelta(days=days)
+    cutoff = _utcnow() - dt.timedelta(days=days)
     db = SessionLocal()
     try:
         jobs = db.query(ResumeResult).filter(ResumeResult.created_at >= cutoff).all()

@@ -29,8 +29,10 @@ def parse_resume(filename: str, payload: bytes) -> str:
 
 
 def _parse_pdf(payload: bytes) -> str:
-    import fitz  # PyMuPDF (import here so DOCX-only callers stay light)
-
+    try:
+        import pymupdf as fitz   # modern module name (PyMuPDF >= 1.24);
+    except ImportError:          # pragma: no cover - older builds
+        import fitz              # legacy shim (deprecation-warns on 1.28)
     doc = fitz.open(stream=payload, filetype="pdf")
     try:
         return " ".join(page.get_text() for page in doc)

@@ -4,12 +4,17 @@ Defines ResumeResult with full metadata for enterprise persistence.
 """
 
 import enum
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, Column, DateTime, Enum, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
+
+
+def _utcnow() -> datetime:
+    """Naive UTC now (datetime.utcnow is deprecated on Python 3.12+)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class JobStatus(enum.Enum):
@@ -72,5 +77,5 @@ class ResumeResult(Base):
     status = Column(Enum(JobStatus), default=JobStatus.QUEUED)
 
     # Timestamps
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
