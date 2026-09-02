@@ -190,9 +190,28 @@ def signup(payload: SignupRequest):
             is_admin=_is_admin_name(payload.username),
         )
         db.add(user)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # Two signups for the same username/email raced past the SELECT
+            # above and collided on the unique index. That is a client-visible
+            # conflict, not a server fault.
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="Username or email already registered",
+            )
         db.refresh(user)
         return _user_payload(user)
+    except HTTPException:
+        raise
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("signup failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Storage backend unavailable, please retry in a moment.",
+        )
     finally:
         db.close()
 

@@ -15,7 +15,7 @@ Prometheus/Grafana observability — all deployable with one command.
 ![Postgres](https://img.shields.io/badge/Database-PostgreSQL-336791?style=for-the-badge&logo=postgresql&logoColor=white)
 
 [![CI](https://github.com/FEMZYKENTLTD/Resume-Screening-Classifier/actions/workflows/deploy.yml/badge.svg)](https://github.com/FEMZYKENTLTD/Resume-Screening-Classifier/actions/workflows/deploy.yml)
-![Tests](https://img.shields.io/badge/Tests-44%20unit%20%2B%2021%20live%20E2E-brightgreen?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Tests-58%20unit%20%2B%2021%20live%20E2E-brightgreen?style=for-the-badge)
 ![Docker](https://img.shields.io/badge/Docker-Compose%20Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 ![Status](https://img.shields.io/badge/Status-Production%20Ready-blueviolet?style=for-the-badge)
@@ -97,7 +97,7 @@ Streamlit UI  ──POST /single_analyze──▶  FastAPI  ──▶ parse → 
 | Feature | Detail |
 |---|---|
 | 🗣 **True NER** | spaCy `en_core_web_sm` → PERSON / ORG extraction, with a **skill-lexicon guard** (stops "Docker" being read as a name 😅) and regex fallback when the model isn't installed |
-| 🧑‍💼 **Trained role classifier** | TF-IDF + logistic regression (`models/role_classifier.joblib`, committed artifact, auditable corpus in `training/`), keyword profiles as fallback |
+| 🧑‍💼 **Trained role classifier** | TF-IDF + logistic regression over **9 role families** (`models/role_classifier.joblib`, committed artifact, auditable corpus in `training/`). Accepts the ML vote on **confidence *or* margin over the runner-up**; keyword profiles as fallback. Validated on a held-out, resume-shaped set — **6/6**, and **4/4** on the real demo PDFs |
 | ♻️ **Smart duplicate detection** | identical resume + identical JD short-circuits to the cached analysis (API check + unique DB index) — watch the "smart cache hit" badge |
 | 🛡 **Graceful degradation** | spaCy / sentence-transformers / scikit-learn are **optional extras** — base images stay lean, features fall back cleanly |
 
@@ -208,7 +208,7 @@ Resume-Screening-Classifier/
 │
 ├── 📁 migrations/              # Alembic — single linear head (7 revisions)
 ├── 📁 models/
-│   └── role_classifier.joblib  # trained artifact (committed, ~105 KB)
+│   └── role_classifier.joblib  # trained artifact (committed, ~170 KB)
 ├── 📁 training/                # auditable training corpus + train_role_classifier.py
 ├── 📁 tests/
 │   └── test_core.py            # 31 end-to-end tests (SQLite + eager Celery)
@@ -350,9 +350,9 @@ Interactive docs: **`/docs`** on the API (Swagger UI).
 Everything claimed above is **machine-verified**, not vibes:
 
 ```bash
-pytest tests/ -q                     # 45 tests — full stack on SQLite + eager Celery
-                                     #   • with scikit-learn installed: 44 passed, 1 spaCy-model skip
-                                     #   • bare CI (no ML extras):      42 passed, 3 auto-skips
+pytest tests/ -q                     # 59 tests — full stack on SQLite + eager Celery
+                                     #   • with scikit-learn installed: 58 passed, 1 spaCy-model skip
+                                     #   • bare CI (no ML extras):      52 passed, 7 auto-skips
 python scripts/verify_ui_live.py     # 21 passed — drives the REAL running stack:
                                      # HTTP login → PDF through the pipeline → AppTest on every page
 ```
@@ -370,6 +370,21 @@ python scripts/verify_ui_live.py     # 21 passed — drives the REAL running sta
 | `test_analyze_via_api_never_raises` | `requests.HTTPError` escaping into the Streamlit UI |
 | `test_safe_json_tolerates_corrupt_rows` | one bad JSON column 500-ing history/results |
 | `test_alembic_migrations_have_single_head` | a split head breaking `alembic upgrade head` on deploy |
+
+**Model & correctness suite** (v5.7):
+
+| Test | Guards against |
+|---|---|
+| `test_classifier_fires_on_real_resume_pdfs` | the trained model never firing on real CVs (asserts `method == "ml-model"` on all 4 demo PDFs) |
+| `test_model_artifact_reports_honest_heldout_metric` | shipping an artifact whose only metric is measured on synthetic text |
+| `test_margin_rule_accepts_confident_and_rejects_flat` | the accept/reject decision rule regressing |
+| `test_data_analyst_profile_exists` | analyst CVs falling into *General / Uncategorized* |
+| `test_classify_role_degrades_when_model_raises` | a corrupt artifact propagating instead of falling back |
+| `test_cplusplus_is_extractable` | `\bc\+\+\b` silently never matching C++ |
+| `test_skill_display_names_are_not_mangled` | "Node.Js" / "Ci/Cd" / "Rest Api" leaking into UI, CSV and PDF |
+| `test_extract_skills_no_false_positives` | substring matches ("go" in "going") |
+| `test_long_password_does_not_crash_signup` | bcrypt's 72-byte limit 500-ing `/auth/signup` |
+| `test_bcrypt_truncation_never_splits_a_character` | truncation emitting invalid UTF-8 |
 
 `verify_ui_live.py` performs true end-to-end round-trips: real logins (admin + non-admin),
 a generated PDF pushed through `single_analyze → pipeline → DB → results`, then
@@ -482,6 +497,31 @@ Three independent defects combined to produce it:
   Alembic single-head guard
 - 🪵 **Structured server-side logging** with full tracebacks; `DEBUG_ERRORS=1` to echo
   details, `API_ANALYZE_TIMEOUT` to tune UI patience for cold machines
+
+**Model & data-quality fixes (second audit pass):**
+
+- 🧠 **The trained classifier now actually runs.** The corpus was short keyword
+  blurbs while real CVs carry contact/education/employer noise — that train/serve
+  mismatch kept the top probability near 0.26–0.30, under the old `MIN_CONFIDENCE=0.45`
+  gate, so **every real upload silently fell back to keyword profiles** (which also
+  mislabelled the data engineer as *DevOps*). Fixed with resume-shaped training data,
+  a **margin-based** accept rule, and a held-out set that the training run enforces.
+  Real demo PDFs went from **2/4 correct (0 via ML)** → **4/4 correct, all via ML**
+- 📊 **Honest metrics.** `cv_macro_f1: 1.0` was measured on synthetic blurbs and did not
+  transfer. The artifact now also records `heldout_accuracy` on never-trained-on,
+  resume-shaped probes, and `train_role_classifier.py` **refuses to save** below 0.80
+- 🆕 **New role family: `Data Analytics / BI`** — analyst CVs previously had no valid
+  label anywhere and landed in *General / Uncategorized*
+- 🔤 **`C++` was undetectable.** `\bc\+\+\b` can never match ('+' is a non-word char,
+  so the trailing `\b` demands a word char after it). Same trap fixed for `node.js`
+  and `ci/cd`
+- 🏷 **Skill names no longer mangled** — `str.title()` produced "Node.Js", "Ci/Cd",
+  "Rest Api", "Aws" in the UI, CSV export and PDF report; canonical casing now
+- 🔐 **`/auth/signup` no longer 500s on long passwords** — the schema allows 128 chars
+  but bcrypt 5.x *raises* above 72 **bytes** (accented passwords hit this fast).
+  Truncation is UTF-8-safe and applied identically on hash and verify
+- 🧯 **Signup race returns 409, not 500** — concurrent duplicate registrations collide
+  on the unique index; verified with 5 parallel signups (`201 409 409 409 409`)
 
 ---
 

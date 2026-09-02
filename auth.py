@@ -26,14 +26,30 @@ def _get_serializer() -> URLSafeTimedSerializer:
     return _serializer
 
 
+# bcrypt hard-rejects secrets longer than 72 BYTES (it silently truncated in
+# older releases; 5.x raises ValueError). The signup schema allows 128 chars,
+# and non-ASCII characters cost several bytes each, so unbounded input made
+# /auth/signup return a 500. Truncate on a byte boundary, identically on both
+# the hash and verify paths so long passwords stay usable.
+BCRYPT_MAX_BYTES = 72
+
+
+def _bcrypt_secret(password: str) -> bytes:
+    raw = (password or "").encode("utf-8")
+    if len(raw) <= BCRYPT_MAX_BYTES:
+        return raw
+    # Never split a multi-byte character in half.
+    return raw[:BCRYPT_MAX_BYTES].decode("utf-8", "ignore").encode("utf-8")
+
+
 def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    return bcrypt.hashpw(_bcrypt_secret(password), bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(password: str, password_hash: str) -> bool:
     try:
-        return bcrypt.checkpw(password.encode("utf-8"),
-                              password_hash.encode("utf-8"))
+        return bcrypt.checkpw(_bcrypt_secret(password),
+                              (password_hash or "").encode("utf-8"))
     except (ValueError, TypeError):
         return False
 

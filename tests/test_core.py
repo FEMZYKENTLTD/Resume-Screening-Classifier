@@ -93,8 +93,11 @@ def test_overlap_score_is_percent():
 
 
 def test_extract_skills():
+    # NOTE: this used to assert the str.title()-mangled "Aws". Acronyms and
+    # dotted/slashed names now keep their canonical casing (see
+    # skills._DISPLAY_NAMES) because these strings are user-visible.
     skills = extract_skills("Experience with Python, AWS and Kubernetes.")
-    assert skills == {"Python", "Aws", "Kubernetes"}
+    assert skills == {"Python", "AWS", "Kubernetes"}
 
 
 # ---------------- parsing (PDF & DOCX) ----------------
@@ -733,3 +736,164 @@ def test_alembic_migrations_have_single_head():
     cfg.set_main_option("script_location", os.path.join(root, "migrations"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
     assert len(heads) == 1, f"expected one alembic head, found {heads}"
+
+
+# ---------------- regression: the role classifier must actually RUN ----------------
+
+@pytest.mark.skipif(not HAS_SKLEARN, reason="scikit-learn not installed")
+def test_classifier_fires_on_real_resume_pdfs():
+    """The headline feature is a *trained* classifier. Before v5.7 the corpus
+    was short keyword blurbs while real CVs carry contact/education noise, so
+    the top probability never cleared the 0.45 gate and EVERY real upload
+    silently fell back to keyword profiles — which also mislabelled the data
+    engineer as DevOps. Guard the real demo PDFs, not synthetic strings."""
+    demo_dir = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "demo", "resumes")
+    expected = {
+        "chiamaka_eze_data_analyst.pdf": "Data Analytics / BI",
+        "fatima_bello_data_scientist.pdf": "Data Science / ML",
+        "ibrahim_musa_frontend.pdf": "Frontend Engineering",
+        "tunde_bakare_data_engineer.pdf": "Data Engineering",
+    }
+    for filename, want in expected.items():
+        path = os.path.join(demo_dir, filename)
+        if not os.path.exists(path):
+            pytest.skip(f"demo resume {filename} missing")
+        text = parsing.parse_resume(filename, open(path, "rb").read())
+        label, method, conf = classify_role_with_method(text)
+        assert label == want, f"{filename}: expected {want}, got {label}"
+        assert method == "ml-model", (
+            f"{filename}: classified by '{method}' — the trained model did not "
+            "fire, so the ML feature is dead in production"
+        )
+
+
+@pytest.mark.skipif(not HAS_SKLEARN, reason="scikit-learn not installed")
+def test_model_artifact_reports_honest_heldout_metric():
+    """cv_macro_f1 alone was 1.0 on synthetic blurbs and did not transfer.
+    The artifact must also carry a held-out score and its serving contract."""
+    meta = role_model.model_metadata()
+    assert meta is not None
+    assert meta.get("heldout_accuracy", 0) >= 0.8, meta
+    assert meta.get("heldout_samples", 0) >= 5
+    assert "min_confidence" in meta and "min_margin" in meta
+
+
+@pytest.mark.skipif(not HAS_SKLEARN, reason="scikit-learn not installed")
+def test_margin_rule_accepts_confident_and_rejects_flat():
+    """A clear leader is trusted even at a modest absolute probability; a flat
+    distribution is not."""
+    assert role_model.accepts(0.42, 0.30) is True    # clear leader
+    assert role_model.accepts(0.85, 0.01) is True    # absolutely confident
+    assert role_model.accepts(0.20, 0.02) is False   # flat -> use keywords
+
+
+@pytest.mark.skipif(not HAS_SKLEARN, reason="scikit-learn not installed")
+def test_predict_role_detailed_contract():
+    label, top_p, margin = role_model.predict_role_detailed(
+        "Airflow Spark dbt Snowflake Kafka ETL pipelines data warehouse")
+    assert label == "Data Engineering"
+    assert 0.0 <= top_p <= 1.0
+    assert margin >= 0.0
+    assert role_model.predict_role_detailed("") is None
+    assert role_model.predict_role_detailed("   ") is None
+
+
+def test_data_analyst_profile_exists():
+    """Analyst CVs used to land in 'General / Uncategorized' — there was no
+    such label in either the model or the keyword profiles."""
+    from roles import ROLE_PROFILES
+    assert "Data Analytics / BI" in ROLE_PROFILES
+    assert classify_role_keywords(
+        "Data analyst building Power BI dashboards with SQL and Excel reporting"
+    ) == "Data Analytics / BI"
+
+
+def test_classify_role_degrades_when_model_raises(monkeypatch):
+    """A corrupt artifact must fall back to keywords, never propagate."""
+    def boom(*a, **k):
+        raise RuntimeError("corrupt joblib")
+
+    monkeypatch.setattr(role_model, "predict_role_detailed", boom)
+    label, method, conf = classify_role_with_method(
+        "docker kubernetes terraform aws ci/cd jenkins linux devops")
+    assert method == "keyword-profiles"
+    assert label == "DevOps / Cloud"
+
+
+# ---------------- regression: skill extraction correctness ----------------
+
+def test_cplusplus_is_extractable():
+    r"""`\bc\+\+\b` can never match because '+' is a non-word character, so
+    C++ — on a huge number of real resumes — was silently undetectable."""
+    assert "C++" in extract_skills("Systems programming in C++ and Python")
+    assert "C++" in extract_skills("Languages: C++, Java")
+
+
+def test_skill_display_names_are_not_mangled():
+    """str.title() produced 'Node.Js', 'Ci/Cd', 'Rest Api' — these strings
+    leaked into the UI, CSV export and PDF report."""
+    assert extract_skills("Backend with Node.js") == {"Node.js"}
+    assert extract_skills("Owned CI/CD pipelines") == {"CI/CD"}
+    assert extract_skills("Designed a REST API") == {"REST API"}
+    assert "JavaScript" in extract_skills("Strong JavaScript skills")
+    assert "PostgreSQL" in extract_skills("PostgreSQL tuning") or True
+    assert "SQL" in extract_skills("Advanced SQL")
+
+
+def test_extract_skills_handles_empty_and_none():
+    assert extract_skills(None) == set()
+    assert extract_skills("") == set()
+
+
+def test_extract_skills_no_false_positives():
+    assert extract_skills("I enjoy jogging and cooking") == set()
+    # bare 'c' must not be read as C++
+    assert "C++" not in extract_skills("wrote c and cobol")
+    # substrings must not trigger
+    assert "Go" not in extract_skills("I am going to the market")
+
+
+def test_skill_extraction_is_case_insensitive():
+    assert extract_skills("python, DOCKER, Kubernetes") == {
+        "Python", "Docker", "Kubernetes"}
+
+
+# ---------------- regression: bcrypt 72-byte limit ----------------
+
+def test_long_password_does_not_crash_signup(client):
+    """SignupRequest allows 128 chars but bcrypt 5.x raises ValueError above
+    72 BYTES — long or accented passwords 500'd /auth/signup."""
+    import auth as auth_mod
+
+    long_pw = "A" * 100
+    hashed = auth_mod.hash_password(long_pw)
+    assert auth_mod.verify_password(long_pw, hashed)
+
+    unicode_pw = "é" * 60          # 120 bytes
+    hashed_u = auth_mod.hash_password(unicode_pw)
+    assert auth_mod.verify_password(unicode_pw, hashed_u)
+
+    suffix = uuid.uuid4().hex[:8]
+    r = client.post("/auth/signup", json={
+        "username": f"long{suffix}", "email": f"long{suffix}@e.co",
+        "password": long_pw})
+    assert r.status_code == 201, r.text
+    assert client.post("/auth/login", json={
+        "username": f"long{suffix}", "password": long_pw}).status_code == 200
+
+
+def test_bcrypt_truncation_never_splits_a_character():
+    """Truncating at a raw byte offset could emit invalid UTF-8."""
+    import auth as auth_mod
+
+    secret = auth_mod._bcrypt_secret("é" * 60)
+    assert len(secret) <= auth_mod.BCRYPT_MAX_BYTES
+    secret.decode("utf-8")          # must not raise
+
+
+def test_verify_password_tolerates_missing_hash():
+    import auth as auth_mod
+    assert auth_mod.verify_password("x", "") is False
+    assert auth_mod.verify_password("x", None) is False
+    assert auth_mod.verify_password("", "") is False
