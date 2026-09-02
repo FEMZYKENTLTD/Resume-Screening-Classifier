@@ -36,6 +36,12 @@ class User(Base):
     created_at = Column(DateTime, server_default=func.now())
     is_admin = Column(Boolean, nullable=False, default=False)
 
+    # Bumped on logout / forced sign-out. Session tokens embed the value they
+    # were minted with, so incrementing this column revokes every outstanding
+    # token for the user (stateless tokens are otherwise un-revocable).
+    token_version = Column(Integer, nullable=False, default=0,
+                           server_default="0")
+
 
 class ResumeResult(Base):
     __tablename__ = "resume_results"

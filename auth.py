@@ -54,19 +54,42 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
-def create_token(user_id: int) -> str:
-    """Signed token identifying a user (stateless)."""
-    return _get_serializer().dumps({"uid": user_id})
+def create_token(user_id: int, token_version: int = 0) -> str:
+    """Signed token identifying a user.
+
+    ``token_version`` mirrors ``users.token_version``. Logging out bumps that
+    column, which instantly invalidates every token minted before the bump —
+    that is what makes "Log out" authoritative on the SERVER, instead of
+    relying on the browser actually dropping its cookie (it often did not,
+    which is why the UI kept resurrecting a session after logout).
+    """
+    return _get_serializer().dumps({"uid": user_id, "tv": int(token_version or 0)})
 
 
-def verify_token(token: str):
-    """Return the user_id for a valid, unexpired token, else None."""
+def decode_token(token: str):
+    """Return ``(user_id, token_version)`` for a valid token, else ``None``.
+
+    Tokens minted before token versioning existed carry no ``tv`` claim; they
+    are read as version 0 so old sessions keep working across the upgrade.
+    """
     if not token:
         return None
     try:
         data = _get_serializer().loads(
             token, max_age=TOKEN_MAX_AGE_DAYS * 24 * 3600
         )
-        return int(data["uid"])
-    except (BadSignature, SignatureExpired, KeyError, TypeError, ValueError):
+        return int(data["uid"]), int(data.get("tv", 0) or 0)
+    except (BadSignature, SignatureExpired, KeyError, TypeError, ValueError,
+            AttributeError):
         return None
+
+
+def verify_token(token: str):
+    """Return the user_id for a valid, unexpired token, else None.
+
+    Signature-level check only — it cannot see the revocation counter. API
+    code should prefer :func:`decode_token` plus a ``token_version`` compare
+    (``api_server._current_user_id`` does exactly that).
+    """
+    decoded = decode_token(token)
+    return None if decoded is None else decoded[0]

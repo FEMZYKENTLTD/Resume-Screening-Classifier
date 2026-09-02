@@ -30,7 +30,10 @@ import parsing  # noqa: E402
 import tasks  # noqa: E402
 import ner  # noqa: E402
 import role_model  # noqa: E402
+import auth as auth_mod  # noqa: E402
 from api_server import app  # noqa: E402
+from database import SessionLocal  # noqa: E402
+from models import User  # noqa: E402
 from database import engine  # noqa: E402
 from extractors import extract_fields  # noqa: E402
 from models import Base  # noqa: E402
@@ -1253,3 +1256,172 @@ def test_pseudonym_is_stable_and_not_the_real_name():
 def test_pseudonymize_handles_empty_input():
     safe, report = pseudonymize("")
     assert safe == "" and report["name"] == 0
+
+
+# ---------------- regression: logout & admin persistence (v5.8) ----------------
+# Two production defects, both reproduced here first:
+#   1. "the site doesn't log out and is stuck on the login page" — tokens were
+#      stateless and un-revocable, so the remembered cookie signed the user
+#      straight back in on the next page load.
+#   2. "my admin account doesn't reflect as admin" — /auth/login mirrored
+#      ADMIN_USERNAMES onto users.is_admin, DEMOTING every admin granted in
+#      the database on their next sign-in.
+
+def test_logout_revokes_token(client):
+    suffix = uuid.uuid4().hex[:8]
+    tok = _token_for(client, f"bye{suffix}", f"bye{suffix}@e.co")
+    h = {"X-User-Token": tok}
+    assert client.get("/auth/me", headers=h).status_code == 200
+
+    out = client.post("/auth/logout", headers=h)
+    assert out.status_code == 200
+    assert out.json()["revoked"] is True
+
+    # The very same token — the one a stale browser cookie would replay — is
+    # now dead everywhere, which is what makes "Log out" actually log out.
+    assert client.get("/auth/me", headers=h).status_code == 401
+    assert client.get("/history", headers=h).status_code == 401
+
+
+def test_logout_is_idempotent_and_login_issues_a_fresh_token(client):
+    suffix = uuid.uuid4().hex[:8]
+    user, pwd = f"again{suffix}", "supersecret1"
+    tok = _token_for(client, user, f"again{suffix}@e.co", pwd)
+    client.post("/auth/logout", headers={"X-User-Token": tok})
+    # Repeat logout / anonymous logout must not error: the UI always calls it.
+    assert client.post("/auth/logout", headers={"X-User-Token": tok}).status_code == 200
+    assert client.post("/auth/logout").status_code == 200
+
+    fresh = client.post("/auth/login", json={"username": user, "password": pwd})
+    assert fresh.status_code == 200
+    new_tok = fresh.json()["token"]
+    assert new_tok != tok
+    assert client.get("/auth/me", headers={"X-User-Token": new_tok}).status_code == 200
+    # ...and the revoked one stays revoked.
+    assert client.get("/auth/me", headers={"X-User-Token": tok}).status_code == 401
+
+
+def test_login_never_demotes_a_database_granted_admin(client):
+    """The exact production bug: is_admin flipped on in the DB, wiped at login."""
+    suffix = uuid.uuid4().hex[:8]
+    user, pwd = f"owner{suffix}", "supersecret1"
+    _token_for(client, user, f"owner{suffix}@e.co", pwd)
+
+    db = SessionLocal()
+    try:
+        row = db.query(User).filter(User.username == user).one()
+        row.is_admin = True          # granted out-of-band (psql / Supabase UI)
+        db.commit()
+    finally:
+        db.close()
+
+    again = client.post("/auth/login", json={"username": user, "password": pwd})
+    assert again.status_code == 200
+    assert again.json()["is_admin"] is True, "login demoted a DB-granted admin"
+    h = {"X-User-Token": again.json()["token"]}
+    assert client.get("/auth/me", headers=h).json()["is_admin"] is True
+    assert client.get("/admin/overview", headers=h).status_code == 200
+
+
+def test_admin_can_grant_and_revoke_admin(client):
+    suffix = uuid.uuid4().hex[:8]
+    admin_tok = _token_for(client, f"admin{suffix}", f"a{suffix}@e.co")
+    db = SessionLocal()
+    try:
+        db.query(User).filter(User.username == f"admin{suffix}").update({"is_admin": True})
+        db.commit()
+    finally:
+        db.close()
+    ah = {"X-User-Token": admin_tok}
+
+    target_tok = _token_for(client, f"promo{suffix}", f"p{suffix}@e.co")
+    th = {"X-User-Token": target_tok}
+    assert client.get("/admin/overview", headers=th).status_code == 403
+
+    uid = client.get("/auth/me", headers=th).json()["user_id"]
+    r = client.post(f"/admin/users/{uid}/admin", headers=ah, json={"is_admin": True})
+    assert r.status_code == 200 and r.json()["is_admin"] is True
+    # No re-login needed: the existing token now sees the admin dashboard.
+    assert client.get("/admin/overview", headers=th).status_code == 200
+    assert client.get("/auth/me", headers=th).json()["is_admin"] is True
+
+    r = client.post(f"/admin/users/{uid}/admin", headers=ah, json={"is_admin": False})
+    assert r.status_code == 200 and r.json()["is_admin"] is False
+    assert client.get("/admin/overview", headers=th).status_code == 403
+
+    # Non-admins cannot promote themselves, and unknown users 404.
+    assert client.post(f"/admin/users/{uid}/admin", headers=th,
+                       json={"is_admin": True}).status_code == 403
+    assert client.post("/admin/users/999999/admin", headers=ah,
+                       json={"is_admin": True}).status_code == 404
+
+
+def test_admin_username_list_still_grants_on_login(client):
+    """ADMIN_USERNAMES keeps working as a GRANT (just never as a demotion)."""
+    suffix = uuid.uuid4().hex[:8]
+    user, pwd = f"listed{suffix}", "supersecret1"
+    _token_for(client, user, f"l{suffix}@e.co", pwd)
+    import api_server
+    original = api_server.ADMIN_USERNAMES
+    api_server.ADMIN_USERNAMES = original | {user.lower()}
+    try:
+        r = client.post("/auth/login", json={"username": user, "password": pwd})
+        assert r.json()["is_admin"] is True
+    finally:
+        api_server.ADMIN_USERNAMES = original
+    # Removing the name again must NOT demote the account.
+    r2 = client.post("/auth/login", json={"username": user, "password": pwd})
+    assert r2.json()["is_admin"] is True
+
+
+def test_owner_bootstrap_promotes_the_oldest_account_when_no_admin_exists(client):
+    """A deployment that lost its admin heals itself for the owner only."""
+    import api_server
+    db = SessionLocal()
+    try:
+        previous = {u.id: u.is_admin for u in db.query(User).all()}
+        db.query(User).update({"is_admin": False})
+        db.commit()
+        owner = db.query(User).order_by(User.id.asc()).first()
+        newest = db.query(User).order_by(User.id.desc()).first()
+        owner_name, newest_name = owner.username, newest.username
+    finally:
+        db.close()
+
+    api_server.ADMIN_BOOTSTRAP_FIRST_USER = True
+    try:
+        # A late signup logging in must NOT be promoted...
+        db = SessionLocal()
+        try:
+            newest_row = db.query(User).filter(User.username == newest_name).one()
+            newest_row.password_hash = auth_mod.hash_password("supersecret1")
+            owner_row = db.query(User).filter(User.username == owner_name).one()
+            owner_row.password_hash = auth_mod.hash_password("supersecret1")
+            db.commit()
+        finally:
+            db.close()
+        r = client.post("/auth/login",
+                        json={"username": newest_name, "password": "supersecret1"})
+        assert r.status_code == 200 and r.json()["is_admin"] is False
+        # ...while the oldest account (the instance owner) is.
+        r = client.post("/auth/login",
+                        json={"username": owner_name, "password": "supersecret1"})
+        assert r.status_code == 200 and r.json()["is_admin"] is True
+    finally:
+        api_server.ADMIN_BOOTSTRAP_FIRST_USER = False
+        db = SessionLocal()
+        try:
+            for uid, flag in previous.items():
+                db.query(User).filter(User.id == uid).update({"is_admin": flag})
+            db.commit()
+        finally:
+            db.close()
+
+
+def test_token_version_claim_roundtrip():
+    """auth.decode_token carries the revocation counter; legacy tokens = v0."""
+    tok = auth_mod.create_token(42, 7)
+    assert auth_mod.decode_token(tok) == (42, 7)
+    assert auth_mod.verify_token(tok) == 42
+    assert auth_mod.decode_token("garbage") is None
+    assert auth_mod.verify_token("") is None

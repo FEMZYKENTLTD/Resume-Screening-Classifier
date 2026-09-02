@@ -15,7 +15,7 @@ Prometheus/Grafana observability — all deployable with one command.
 ![Postgres](https://img.shields.io/badge/Database-PostgreSQL-336791?style=for-the-badge&logo=postgresql&logoColor=white)
 
 [![CI](https://github.com/FEMZYKENTLTD/Resume-Screening-Classifier/actions/workflows/deploy.yml/badge.svg)](https://github.com/FEMZYKENTLTD/Resume-Screening-Classifier/actions/workflows/deploy.yml)
-![Tests](https://img.shields.io/badge/Tests-65%20unit%20%2B%2021%20live%20E2E-brightgreen?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Tests-88%20unit%20%2B%2032%20live%20E2E-brightgreen?style=for-the-badge)
 ![Docker](https://img.shields.io/badge/Docker-Compose%20Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 ![Status](https://img.shields.io/badge/Status-Production%20Ready-blueviolet?style=for-the-badge)
@@ -213,14 +213,15 @@ Resume-Screening-Classifier/
 ├── 📄 models.py                # SQLAlchemy models
 ├── 📄 database.py              # env-driven engine/session
 │
-├── 📁 migrations/              # Alembic — single linear head (7 revisions)
+├── 📁 migrations/              # Alembic — single linear head (8 revisions)
 ├── 📁 models/
 │   └── role_classifier.joblib  # trained artifact (committed, ~170 KB)
 ├── 📁 training/                # auditable training corpus + train_role_classifier.py
 ├── 📁 tests/
-│   └── test_core.py            # 31 end-to-end tests (SQLite + eager Celery)
+│   └── test_core.py            # 88 end-to-end tests (SQLite + eager Celery)
 ├── 📁 scripts/
-│   └── verify_ui_live.py       # 21-check live E2E (AppTest + HTTP round-trips)
+│   ├── verify_ui_live.py       # 32-check live E2E (AppTest + HTTP round-trips)
+│   └── grant_admin.py          # break-glass: grant/revoke admin, force-logout
 ├── 📁 demo/resumes/            # 🎬 demo kit: 4 sample resumes (+ job_description.txt)
 ├── 📁 .streamlit/
 │   └── config.toml             # server + Aurora theme
@@ -263,8 +264,20 @@ Then open:
 | 📊 Grafana (admin/admin) | http://localhost:3000 |
 | 📈 Prometheus | http://localhost:9090 |
 
-Migrations run automatically on API start. Sign up on the UI, or make yourself admin by
-adding your username to `ADMIN_USERNAMES`.
+Migrations run automatically on API start.
+
+**Becoming admin** — any one of these works:
+1. **Sign up first.** The very first account on a fresh instance is the owner and is made
+   admin automatically (`ADMIN_BOOTSTRAP_FIRST_USER=1`).
+2. **Name it in the config:** `ADMIN_USERNAMES=admin,femzyk` (or `ADMIN_EMAILS=…`), then log in.
+3. **Ask an existing admin** to flip it in **🛠 Admin → 🛡 Roles & Access** (takes effect for
+   that user within 30 s, no re-login needed).
+4. **Break glass, no admin left:**
+   ```bash
+   DATABASE_URL="postgresql://…" python scripts/grant_admin.py --list
+   DATABASE_URL="postgresql://…" python scripts/grant_admin.py --username femzyk
+   ```
+   Admin granted in the database is **never** silently removed by logging in.
 
 ### 🐍 Option B — Local dev (hot reload)
 
@@ -296,7 +309,14 @@ API_URL=http://localhost:8000 streamlit run app.py
 | `API_URL` | `http://localhost:8000` | where the UI finds the API |
 | `AUTH_SECRET_KEY` | **change me!** | token-signing secret (long random string in prod) |
 | `TOKEN_MAX_AGE_DAYS` | `7` | session token lifetime |
-| `ADMIN_USERNAMES` | `admin` | comma-separated admin usernames |
+| `ADMIN_USERNAMES` | `admin` | comma-separated usernames that are **granted** admin at signup/login |
+| `ADMIN_EMAILS` | — | same, matched on email |
+| `ADMIN_BOOTSTRAP_FIRST_USER` | `1` | if the instance has **no** admin, promote the oldest (owner) account |
+| `ADMIN_STRICT_SYNC` | `0` | `1` = mirror the lists exactly, demoting anyone not listed (off by default: it used to wipe DB-granted admins) |
+| `ALLOW_LEGACY_LOGIN` | `1` | `0` = never fall back to the env-credential login when the API is down |
+| `API_HEALTH_TIMEOUT` / `API_HEALTH_RETRIES` | `8` / `3` | how patient the UI is with a cold API before declaring it offline |
+| `API_ANALYZE_TIMEOUT` | `120` | UI timeout for `/single_analyze` |
+| `CORS_ALLOW_ORIGINS` | `*` | lock the API down to your UI origin in production |
 | `ENABLE_SEMANTIC` | `0` | `1` = blend embedding score (needs sentence-transformers) |
 | `HR_PASSWORD` / `RECRUITER_PASSWORD` / `COOKIE_KEY` | — | **legacy** offline login only (API down) |
 
@@ -339,7 +359,9 @@ tech-stack mix, score histogram — plus a **401/403 security gate** (machine-ve
 |---|---|---|---|
 | `GET` | `/health` | — | liveness probe |
 | `POST` | `/auth/signup` | — | create account → `{ token }` |
-| `POST` | `/auth/login` | — | `{ username, password }` → `{ token, is_admin }` |
+| `POST` | `/auth/login` | — | `{ username, password }` → `{ token, is_admin }` (grant-only admin sync) |
+| `GET` | `/auth/me` | 🔒 | validate a token → current `{ username, email, is_admin }` |
+| `POST` | `/auth/logout` | 🔒 | revoke **every** token for the caller (`token_version++`) — idempotent |
 | `POST` | `/single_analyze` | optional | multipart resume + JD → `200` completed result (dedup-aware) |
 | `GET` | `/results/{job_id}` | — | job status → score, role, fields, skills |
 | `GET` | `/history` | 🔒 | caller's analyses |
@@ -347,6 +369,7 @@ tech-stack mix, score histogram — plus a **401/403 security gate** (machine-ve
 | `GET` | `/admin/overview` | 👑 | users/jobs/status totals |
 | `GET` | `/admin/users` | 👑 | user registry w/ job stats |
 | `GET` | `/admin/users/{id}/jobs` | 👑 | per-user drill-down |
+| `POST` | `/admin/users/{id}/admin` | 👑 | `{ is_admin }` → grant/revoke admin (last admin protected) |
 | `GET` | `/admin/trends?days=N` | 👑 | activity & distribution trends |
 | `GET` | `/metrics` | — | Prometheus exposition (API + worker) |
 
@@ -441,12 +464,13 @@ scrubber and auditor share one `_is_phone()` rule so they cannot disagree.
 Everything claimed above is **machine-verified**, not vibes:
 
 ```bash
-pytest tests/ -q                     # 81 tests — full stack on SQLite + eager Celery
-                                     #   • with spaCy + scikit-learn:   80 passed, 1 model-only skip
-                                     #   • bare CI (no ML extras):      72 passed, 9 auto-skips
+pytest tests/ -q                     # 88 tests — full stack on SQLite + eager Celery
+                                     #   • with spaCy + scikit-learn:   87 passed, 1 model-only skip
+                                     #   • bare CI (no ML extras):      78 passed, 10 auto-skips
 python -m training.train_role_classifier   # retrain + REFUSE to ship a bad model
-python scripts/verify_ui_live.py     # 21 passed — drives the REAL running stack:
+python scripts/verify_ui_live.py     # 32 passed — drives the REAL running stack:
                                      # HTTP login → PDF through the pipeline → AppTest on every page
+                                     # → logout revocation → admin-role stability
 ```
 
 **Resilience suite** (added in v5.7, covering the production `/single_analyze` 500):
@@ -488,6 +512,45 @@ CI runs the same gates on every push: **compile → migrate-check → test suite
 ---
 
 ## 🛠 Troubleshooting
+
+### 🚪 "Log out doesn't work / I'm stuck on the login page" (fixed in v5.9)
+
+Three separate defects stacked up:
+
+| # | Root cause | Fix |
+|---|---|---|
+| 1 | Session tokens were **stateless and un-revocable**. Logging out only tried to delete a browser cookie | `POST /auth/logout` bumps `users.token_version`; every token minted earlier dies instantly (server-side, all devices) |
+| 2 | The cookie-clearing `<script>` was rendered and then `st.rerun()` **ripped the iframe out of the DOM before it executed**, so the cookie survived | the deletion is now rendered on the login page that stays on screen, and it writes through `window.parent.document.cookie` |
+| 3 | `st.context.cookies` reflects the cookie header of the **original page load** — after logout it still contained the old token, so the "restore my session" block signed the user straight back in | a `logged_out` session flag suppresses cookie restore for the rest of that browser session |
+
+The "stuck on the login page" half had a fourth cause: a single slow `/health` probe
+(3 s timeout, no retry) against a cold backend flipped the whole UI into the **legacy
+env-credential login**, which real database accounts can never pass. The probe is now
+cached (30 s), retried 3×, and **sticky** — once the API has answered in a browser
+session the UI shows a "reconnecting" banner instead of demoting you to the offline form
+(`ALLOW_LEGACY_LOGIN=0` disables that fallback entirely).
+
+### 👑 "My admin account doesn't show as admin" (fixed in v5.9)
+
+`/auth/login` used to *mirror* `ADMIN_USERNAMES` onto the account:
+
+```python
+should_be = _is_admin_name(user.username)
+if bool(user.is_admin) != should_be:
+    user.is_admin = should_be      # ← demoted every DB-granted admin, silently
+```
+
+So flipping `is_admin` in Supabase worked exactly until the next login, which set it
+back to `false`. Reproduced, then fixed:
+
+- the env lists are now **grant-only** (opt back in with `ADMIN_STRICT_SYNC=1`);
+- **owner bootstrap**: if the instance has no admin at all, the oldest account is
+  promoted on login (a late signup can never grab it);
+- `POST /admin/users/{id}/admin` + the **🛡 Roles & Access** panel let an admin promote
+  or demote anyone, with the last admin protected;
+- the UI re-reads `/auth/me` every 30 s, so a promotion appears **without re-login**
+  (and a revoked session is dropped immediately);
+- `scripts/grant_admin.py` is the break-glass CLI when nobody can get in.
 
 ### `500 Server Error ... /single_analyze` (fixed in v5.7)
 
@@ -622,6 +685,26 @@ docker build --build-arg SPACY_MODEL_REQUIRED=1 -f Dockerfile.api .
 
 ---
 
+## 🆕 What's new in v5.9 — session & role integrity
+
+- 🚪 **Logout actually logs out.** New `POST /auth/logout` revokes every outstanding
+  token by bumping `users.token_version` (new Alembic revision, single head kept), so a
+  stale cookie can no longer resurrect a session. The UI also revokes server-side first,
+  then expires the cookie on a page that survives long enough to run the script
+- 🔁 **No more "stuck on the login page."** The `/health` probe is cached, retried and
+  sticky — a cold backend no longer drops the UI into the legacy offline login
+- 👑 **Admin rights stop disappearing.** `ADMIN_USERNAMES` / new `ADMIN_EMAILS` are
+  grant-only; owner bootstrap heals an instance with no admin; `ADMIN_STRICT_SYNC=1`
+  restores the old mirror behaviour if you really want it
+- 🛡 **Roles & Access panel** + `POST /admin/users/{id}/admin` — promote/demote from the
+  Admin dashboard, last-admin protected, live for the target user in ≤30 s
+- 🧰 **`scripts/grant_admin.py`** — list users, grant/revoke admin, force-logout, straight
+  against `DATABASE_URL`
+- 🧪 **+7 unit tests and +11 live checks** covering exactly these two regressions
+  (88 unit · 32 live)
+
+---
+
 ## 🆕 What's new in v5.8 — the classifier gets a real corpus
 
 - 📚 **619-document training corpus** (`training/corpus.py`) — a seeded, reproducible
@@ -726,7 +809,7 @@ docker build --build-arg SPACY_MODEL_REQUIRED=1 -f Dockerfile.api .
 - 🎬 **Demo kit** — 4 realistic sample resumes + ready-made JD in `demo/` for instant try-outs
 - 🐛 **PDF export crash fixed** (fpdf2 `bytearray` API change) — caught by live AppTest
 - 🧠 **NER name hardening** — skill-lexicon guard + first-line span trim ("Docker" is a tool, not a person)
-- 🧪 **21-check live E2E harness** (`scripts/verify_ui_live.py`)
+- 🧪 **32-check live E2E harness** (`scripts/verify_ui_live.py`)
 - 📜 **LICENSE + hardened `.gitignore`** (secrets, runtime artifacts, 290 MB wheel mirrors)
 - 🧹 2026 deprecation sweep (`use_container_width` → `width="stretch"`, fpdf2 modern API)
 

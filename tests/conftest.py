@@ -31,6 +31,10 @@ if not os.environ.get("DATABASE_URL"):
 os.environ.setdefault("AUTH_SECRET_KEY", "test-secret-not-for-production")
 os.environ.setdefault("JWT_SECRET", "test-secret-not-for-production")
 os.environ.setdefault("ADMIN_USERNAMES", "admin")
+# Owner bootstrap is deployment behaviour, not a test default: keep it off so
+# admin/non-admin fixtures stay deterministic. Tests that exercise it flip
+# api_server.ADMIN_BOOTSTRAP_FIRST_USER explicitly.
+os.environ.setdefault("ADMIN_BOOTSTRAP_FIRST_USER", "0")
 # Keep optional integrations off unless a test explicitly enables them.
 os.environ.setdefault("ENABLE_SEMANTIC", "0")
 
