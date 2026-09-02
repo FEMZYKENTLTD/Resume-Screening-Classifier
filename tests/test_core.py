@@ -750,7 +750,7 @@ def test_alembic_migrations_have_single_head():
 
 @pytest.mark.skipif(not HAS_SKLEARN, reason="scikit-learn not installed")
 def test_classifier_fires_on_real_resume_pdfs():
-    """The headline feature is a *trained* classifier. Before v5.7 the corpus
+    """The headline feature is a *trained* classifier. The original corpus
     was short keyword blurbs while real CVs carry contact/education noise, so
     the top probability never cleared the 0.45 gate and EVERY real upload
     silently fell back to keyword profiles — which also mislabelled the data
@@ -1258,7 +1258,7 @@ def test_pseudonymize_handles_empty_input():
     assert safe == "" and report["name"] == 0
 
 
-# ---------------- regression: logout & admin persistence (v5.8) ----------------
+# ---------------- regression: logout & admin persistence ----------------
 # Two production defects, both reproduced here first:
 #   1. "the site doesn't log out and is stuck on the login page" — tokens were
 #      stateless and un-revocable, so the remembered cookie signed the user
@@ -1425,3 +1425,15 @@ def test_token_version_claim_roundtrip():
     assert auth_mod.verify_token(tok) == 42
     assert auth_mod.decode_token("garbage") is None
     assert auth_mod.verify_token("") is None
+
+
+def test_version_is_v1_and_single_sourced():
+    """The release number lives in ONE place (the VERSION file) and the API
+    reports it. Guards against the version sprawl this repo used to have."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "VERSION"), encoding="utf-8") as fh:
+        declared = fh.read().strip()
+    assert declared.startswith("1.0"), f"VERSION must be v1.0.x, got {declared}"
+    import api_server
+    assert api_server.APP_VERSION == declared
+    assert app.version == declared

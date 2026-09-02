@@ -20,6 +20,7 @@ import datetime as dt
 import json
 import logging
 import os
+import pathlib
 import time
 import traceback
 import uuid
@@ -49,7 +50,14 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-app = FastAPI(title="Resume Classifier API (Sync)", version="5.9.0")
+# Single source of truth for the release number (see the VERSION file).
+try:
+    APP_VERSION = (pathlib.Path(__file__).with_name("VERSION")
+                   .read_text(encoding="utf-8").strip() or "1.0.0")
+except OSError:                                  # pragma: no cover - packaging
+    APP_VERSION = "1.0.0"
+
+app = FastAPI(title="ResumeRank API", version=APP_VERSION)
 
 MAX_RESUME_BYTES = 10 * 1024 * 1024  # 10 MB safety cap
 MAX_JD_CHARS = 20000                 # pasted-JD sanity cap
@@ -161,7 +169,7 @@ def _current_user_id(x_user_token: str | None) -> int | None:
         current = db.query(User.token_version).filter(User.id == user_id).first()
     except SQLAlchemyError as exc:
         # e.g. the token_version migration has not been applied yet. Degrade
-        # to signature-only validation (the pre-5.8 behaviour) instead of
+        # to signature-only validation (the pre-token_version behaviour) instead of
         # locking every user out of their account.
         logger.warning("token_version check unavailable (%s); "
                        "run 'alembic upgrade head'", exc)

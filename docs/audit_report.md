@@ -6,6 +6,10 @@
 **Subject:** Repository ownership handover, CI failure root-cause analysis, README verification audit
 **Scope:** commit `910fcf6` on `main` (failng run: [Verify & Deploy #33447066825](https://github.com/FEMZYKENTLTD/Resume-Screening-Classifier/actions/runs/33447066825))
 
+> ⚠️ **Historical document.** The numbers below were correct on 2026-08-31. They have since
+> been superseded — see [§5 Addendum — v1.0](#-5-addendum--v10-release-audit) at the end of
+> this file for the current, re-measured figures.
+
 ---
 
 ## 🏛️ 1. Ownership & Executive Summary
@@ -27,7 +31,7 @@ repairs, and a full verification of every claim in the README against the actual
 | 4 | Signup accepted any credentials | Pydantic models had no constraints (tests expect 422 on short username/password) | `SignupRequest`: username ≥ 3, password ≥ 8, email ≤ 100; **login deliberately lenient** so wrong passwords stay `401`, not `422` |
 | 5 | Analytics page crashed (`KeyError: 'score_histogram'`) | UI/API contract drift — endpoint no longer returned the histogram | `/analytics/summary` + `/admin/trends` expose `score_histogram` (ten 10-wide buckets) |
 | 6 | Admin page crashed (`KeyError: 'by_status'`, `'last_active'`) | Same drift on `/admin/overview` + `/admin/users` | Overview: `by_status`, `jobs_last_7d`, `avg_match_score`. Users: per-user `completed` / `failed` / `last_active`, computed in a single scan (N+1 query removed) |
-| 7 | Node.js 20 deprecation warning in Actions | `actions/checkout@v4`, `actions/setup-python@v5` target Node 20 (removed from runners 2026-09-16) | Bumped to `checkout@v7`, `setup-python@v7`; pinned `flyctl-actions/setup-flyctl@v1` (was floating `@master`). **Handoff:** the sandbox GitHub token lacks the `workflows` permission, so the corrected workflow ships as `docs/deploy.yml.node24` — apply with `cp docs/deploy.yml.node24 .github/workflows/deploy.yml` |
+| 7 | Node.js 20 deprecation warning in Actions | `actions/checkout@v4`, `actions/setup-python@v5` target Node 20 (removed from runners 2026-09-16) | Bumped to `checkout@v7`, `setup-python@v7`; pinned `flyctl-actions/setup-flyctl@v1` (was floating `@master`). **✅ Resolved:** the Node 24 action bumps are live in `.github/workflows/deploy.yml`, so the `docs/deploy.yml.node24` reference copy was deleted in v1.0. One cosmetic delta remains and needs a human with `workflows` permission: replace the two `pip install -r requirements.txt` / `pip install pytest httpx` lines with `pip install -r requirements.txt -r requirements-dev.txt` to pin CI test tooling |
 
 ---
 
@@ -86,3 +90,44 @@ verification plan.
 *Signed,*
 **Principal Machine Learning Engineer & Architect**
 *ResumeRank Platform Owner*
+
+---
+
+## 🔟 5. Addendum — v1.0 release audit
+
+**Date:** September 2, 2026 · **Scope:** branch `arena/01a06332-resume-screening-classifier`
+(the v1.0 release commit). Everything here was re-measured in a clean environment, not
+carried over from the report above.
+
+### Defects found and fixed in this pass
+
+| # | Defect (as reported by the owner) | Root cause | Fix |
+|---|---|---|---|
+| 1 | "The site doesn't log out" | Session tokens were stateless and un-revocable; the cookie-clearing component was destroyed by `st.rerun()` before its script could run; `st.context.cookies` still held the old token on the next run, so the restore path signed the user back in | `users.token_version` + `POST /auth/logout` (server-side revocation), deletion rendered on a page that survives, `logged_out` flag blocks cookie restore |
+| 2 | "Stuck on the login page" | A single 3 s `/health` probe against a cold API flipped the UI into the legacy env-credential login, which database accounts can never pass | Probe retried ×3, cached 30 s, sticky once seen up; `ALLOW_LEGACY_LOGIN=0` disables the fallback; legacy mode also gained the **Log out** button it never had |
+| 3 | "My admin account doesn't reflect as admin" | `/auth/login` mirrored `ADMIN_USERNAMES` onto `users.is_admin`, demoting every DB-granted admin on sign-in (reproduced: `is_admin` 1 → 0) | Grant-only sync (`ADMIN_STRICT_SYNC=1` to opt out), owner bootstrap, `POST /admin/users/{id}/admin` + Roles & Access UI, `scripts/grant_admin.py`, live `/auth/me` refresh every 30 s |
+| 4 | Stale CI handoff | The Node 24 workflow fix had been applied, but a 109-line duplicate (`docs/deploy.yml.node24`) and its instructions lingered | Duplicate deleted; the single remaining one-line CI improvement is documented inline in `requirements-dev.txt` (workflow edits need `workflows` token permission) |
+| 5 | README drift | Undocumented `/auth/me`; stale counts (tests, live checks, Alembic revisions); duplicated `training/` entry in the file tree; broken LinkedIn markdown link; version sprawl (v5.5 → v5.9) | README corrected end-to-end and **relabelled to a single version: v1.0** |
+
+### Verification (all executed on this branch)
+
+| Gate | Command | Result |
+|------|---------|--------|
+| Compile | `python -m compileall -q .` | ✅ clean |
+| Unit + integration, with extras | `pytest -q` (scikit-learn + spaCy + psycopg2) | ✅ **88 passed, 1 skipped** (skip = pretrained spaCy weights, download blocked offline) |
+| Unit + integration, bare | `pytest -q` (no optional extras) | ✅ **79 passed, 10 auto-skips** — 89 tests collected |
+| Migrations | `alembic upgrade head` on a fresh database | ✅ **8 revisions, single linear head**, `users.token_version` created |
+| Live E2E | `scripts/verify_ui_live.py` against real `uvicorn` + `streamlit` | ✅ **32 passed, 0 failed** (was 21 — added logout revocation, role stability and UI logout-button checks) |
+| Model artifact | `models/role_classifier.joblib` metadata | ✅ 9 labels · 619 samples · held-out accuracy **1.0 over 141 docs** — matches the README claim |
+
+### README claim spot-checks
+
+| Claim | Status |
+|---|---|
+| 9 role families · 619 training docs · 100% over 141 held-out docs | ✅ read back from the shipped artifact metadata |
+| `docker compose up` → 7 services | ✅ db · redis · api · worker · streamlit · prometheus · grafana |
+| Every test name cited in the README exists | ✅ all resolve to `tests/test_core.py` |
+| Every documented endpoint exists, and every endpoint is documented | ✅ 15 routes reconciled both ways |
+| Alembic single linear head, auto-applied on deploy | ✅ verified (`wait-for-db.sh` + Fly `release_command`) |
+
+*Signed,* **Platform Owner — v1.0 release audit**

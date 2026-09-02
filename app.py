@@ -925,6 +925,10 @@ if not USING_API:
     if not auth_status:
         st.stop()
     st.session_state.username = name
+    # Keep a handle on the authenticator so the sidebar can offer a working
+    # "Log out" in offline mode too — without this the legacy path had NO way
+    # out of the session at all (the API-mode button is token-gated).
+    st.session_state._legacy_auth = authenticator
 
 # ---------------- SIDEBAR ----------------
 initial = (st.session_state.username or "?")[0].upper()
@@ -971,6 +975,25 @@ if st.session_state.token and st.sidebar.button("🚪 Log out", width="stretch")
     st.session_state.logged_out = True
     st.session_state._admin_checked_at = 0.0
     _flash("Signed out — see you soon 👋", "🔒")
+    st.rerun()
+
+if not USING_API and st.session_state.username and st.sidebar.button(
+        "🚪 Log out", width="stretch", key="legacy_logout"):
+    # Offline/legacy mode: clear streamlit-authenticator's cookie through its
+    # own API (signature differs across 0.3.x / 0.4.x), then wipe local state.
+    legacy_auth = st.session_state.get("_legacy_auth")
+    for call in (lambda: legacy_auth.logout(location="unrendered"),
+                 lambda: legacy_auth.logout("Log out", "unrendered"),
+                 lambda: legacy_auth.logout("Log out", "sidebar")):
+        try:
+            call()
+            break
+        except Exception:
+            continue
+    for key in ("username", "screen", "name", "authentication_status", "_legacy_auth"):
+        st.session_state.pop(key, None)
+    st.session_state.username = None
+    _flash("Signed out 👋", "🔒")
     st.rerun()
 
 st.sidebar.markdown(
