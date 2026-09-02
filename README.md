@@ -200,6 +200,10 @@ Resume-Screening-Classifier/
 ├── 📄 skills.py                # curated tech-skill lexicon
 ├── 📄 roles.py                 # keyword-profile role classifier (fallback)
 ├── 📄 role_model.py            # trained TF-IDF + logistic-regression classifier
+├── 📄 requirements.txt         # runtime deps (what the images install)
+├── 📄 requirements-dev.txt     # + pytest/httpx — CI and local testing only
+├── 📄 pytest.ini               # test discovery + strict markers
+├── 📄 .dockerignore            # keeps .git/.venv/wheels out of build context
 ├── 📄 scoring.py               # match score (0–100) + gap analysis
 ├── 📁 training/
 │   ├── 📄 pseudonymize.py      # strip PII from REAL resumes (fail-closed audit)
@@ -267,6 +271,8 @@ adding your username to `ADMIN_USERNAMES`.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+# to run the test suite as well (pytest + httpx, pinned):
+pip install -r requirements-dev.txt
 # optional ML extras (NER + trained classifier + semantic):
 pip install scikit-learn==1.9.0 spacy==3.8.16 sentence-transformers==6.0.0 \
   "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"

@@ -13,8 +13,10 @@ import sys
 import uuid
 import zipfile
 
-# Point the app at a throwaway SQLite file BEFORE importing app modules.
-os.environ["DATABASE_URL"] = "sqlite:////tmp/test_resume_classifier.db"
+# DATABASE_URL is set in tests/conftest.py (imported by pytest before this
+# module) to a unique throwaway SQLite file per run. The fallback below only
+# matters when this file is executed directly, outside pytest.
+os.environ.setdefault("DATABASE_URL", "sqlite:////tmp/test_resume_classifier.db")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import fitz  # noqa: E402
@@ -62,7 +64,9 @@ def client():
     )
     with TestClient(app) as c:
         yield c
-    os.unlink("/tmp/test_resume_classifier.db")
+    # Teardown of the database file is owned by tests/conftest.py, which
+    # created it. Unlinking a hard-coded path here raised FileNotFoundError
+    # once the DB moved to a per-run temp directory.
 
 
 def _sample_pdf(text: str) -> bytes:
