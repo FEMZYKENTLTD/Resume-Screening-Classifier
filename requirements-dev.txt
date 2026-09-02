@@ -1,0 +1,30 @@
+# Development / CI dependencies.
+#
+# Install the runtime stack first, then this file:
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+# CI NOTE: .github/workflows/deploy.yml still does an unpinned
+#   pip install pytest httpx
+# because the Arena GitHub App token lacks the 'workflows' permission and
+# cannot push workflow edits. Apply the one-line fix manually:
+#   cp docs/deploy.yml.node24 .github/workflows/deploy.yml
+# (that copy already installs -r requirements-dev.txt instead).
+#
+# These are NOT installed in the production images (Dockerfile.api /
+# .worker / .streamlit) — test tooling has no business in a deploy artifact.
+
+-r requirements.txt
+
+pytest==9.1.1
+httpx==0.28.1          # REQUIRED by fastapi.testclient.TestClient (starlette
+                       # imports it lazily; without it every API test errors
+                       # at collection with "RuntimeError: The starlette.
+                       # testclient module requires the httpx package")
+
+# --- Optional ML extras, pinned so CI can exercise the ML code paths ---
+# The app degrades gracefully without these (see requirements.txt), but the
+# full test suite only reaches the classifier/NER branches when they exist.
+# Uncomment, or install in a dedicated "ml" CI job, to run all 81 tests
+# instead of the 72-pass / 9-skip bare run.
+# scikit-learn==1.9.0
+# spacy==3.8.16

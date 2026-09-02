@@ -1,0 +1,59 @@
+# Keep the build context small and secret-free.
+# Without this file every `flyctl deploy` uploads .venv/, .git/ and any local
+# wheel mirror (~290 MB), which is slow and can leak local state into images.
+#
+# NOTE: models/, migrations/, alembic.ini and demo/ are deliberately NOT
+# excluded — the worker loads models/role_classifier.joblib at runtime and the
+# API runs `alembic upgrade head` on boot.
+
+# Secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.pem
+*.key
+
+# Version control / CI
+.git
+.gitignore
+.github
+
+# Local virtualenvs
+.venv
+venv
+env
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Tests + dev tooling (not needed in a runtime image)
+tests/
+pytest.ini
+requirements-dev.txt
+scripts/verify_ui_live.py
+
+# Offline wheel mirrors (~290 MB)
+wheels/
+wheels-linux/
+
+# Local runtime artifacts
+*.log
+*.db
+*.sqlite3
+db_data/
+control/
+demo-data/
+training/real_corpus.jsonl
+
+# Docs and editor/OS cruft
+docs/
+.DS_Store
+.idea/
+.vscode/
+*.swp

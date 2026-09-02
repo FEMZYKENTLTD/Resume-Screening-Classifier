@@ -31,6 +31,12 @@ requests==2.34.2
 bcrypt==5.0.0
 itsdangerous==2.2.0
 
+# Model loading. role_model.py imports joblib to load
+# models/role_classifier.joblib. It was previously undeclared and only present
+# as a transitive dep of scikit-learn — so a deploy WITHOUT the ML extras had
+# no joblib and silently fell back to keyword classification.
+joblib==1.6.0
+
 # Observability (tiny — always on)
 prometheus-client==0.26.0
 

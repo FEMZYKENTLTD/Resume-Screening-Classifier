@@ -35,6 +35,13 @@ ROLE_PROFILES = {
         "spark", "hadoop", "airflow", "etl", "pipeline", "snowflake",
         "bigquery", "kafka", "data warehouse", "dbt", "data lake",
     ],
+    # Distinct from Data Science / ML: BI and reporting work, not modelling.
+    # Without this, analyst resumes fell through to "General / Uncategorized".
+    "Data Analytics / BI": [
+        "data analyst", "business intelligence", "power bi", "tableau",
+        "looker", "dashboard", "excel", "reporting", "sql", "kpi",
+        "google analytics", "data visualization", "spreadsheet",
+    ],
     "Mobile Development": [
         "android", "ios", "swift", "kotlin", "flutter", "react native",
         "mobile", "xcode",
@@ -74,19 +81,25 @@ def classify_role_keywords(text: str) -> str:
 
 def classify_role(text: str) -> str:
     """Best role label for the resume text: ML model first, keywords second."""
-    pred = role_model.predict_role(text)
-    if pred is not None:
-        label, confidence = pred
-        if confidence >= role_model.MIN_CONFIDENCE:
-            return label
-    return classify_role_keywords(text)
+    return classify_role_with_method(text)[0]
 
 
 def classify_role_with_method(text: str):
-    """(label, method, confidence_or_None) — used for reporting/debugging."""
-    pred = role_model.predict_role(text)
-    if pred is not None:
-        label, confidence = pred
-        if confidence >= role_model.MIN_CONFIDENCE:
-            return label, "ml-model", round(confidence, 4)
+    """(label, method, confidence_or_None) — used for reporting/debugging.
+
+    Accepts the ML vote when it is either absolutely confident OR clearly
+    ahead of the runner-up (see role_model.MIN_MARGIN). Keyword profiles
+    remain the fallback, and any failure inside the ML path degrades to them
+    rather than propagating — the API contract promises graceful degradation.
+    """
+    try:
+        detailed = role_model.predict_role_detailed(text)
+    except Exception:
+        detailed = None
+
+    if detailed is not None:
+        label, top_p, margin = detailed
+        if role_model.accepts(top_p, margin):
+            return label, "ml-model", round(top_p, 4)
+
     return classify_role_keywords(text), "keyword-profiles", None

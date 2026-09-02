@@ -47,3 +47,6 @@ Desktop.ini
 
 # ==================== Node (future-proofing only) ====================
 node_modules/
+
+# Pseudonymized real-resume corpus: opt in deliberately before committing
+training/real_corpus.jsonl

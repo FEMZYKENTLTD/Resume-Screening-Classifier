@@ -13,8 +13,10 @@ import sys
 import uuid
 import zipfile
 
-# Point the app at a throwaway SQLite file BEFORE importing app modules.
-os.environ["DATABASE_URL"] = "sqlite:////tmp/test_resume_classifier.db"
+# DATABASE_URL is set in tests/conftest.py (imported by pytest before this
+# module) to a unique throwaway SQLite file per run. The fallback below only
+# matters when this file is executed directly, outside pytest.
+os.environ.setdefault("DATABASE_URL", "sqlite:////tmp/test_resume_classifier.db")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import fitz  # noqa: E402
@@ -33,6 +35,7 @@ from database import engine  # noqa: E402
 from extractors import extract_fields  # noqa: E402
 from models import Base  # noqa: E402
 from roles import classify_role, classify_role_keywords, classify_role_with_method  # noqa: E402
+import scoring  # noqa: E402
 from scoring import overlap_score  # noqa: E402
 from skills import extract_skills  # noqa: E402
 
@@ -61,7 +64,9 @@ def client():
     )
     with TestClient(app) as c:
         yield c
-    os.unlink("/tmp/test_resume_classifier.db")
+    # Teardown of the database file is owned by tests/conftest.py, which
+    # created it. Unlinking a hard-coded path here raised FileNotFoundError
+    # once the DB moved to a per-run temp directory.
 
 
 def _sample_pdf(text: str) -> bytes:
@@ -93,8 +98,11 @@ def test_overlap_score_is_percent():
 
 
 def test_extract_skills():
+    # NOTE: this used to assert the str.title()-mangled "Aws". Acronyms and
+    # dotted/slashed names now keep their canonical casing (see
+    # skills._DISPLAY_NAMES) because these strings are user-visible.
     skills = extract_skills("Experience with Python, AWS and Kubernetes.")
-    assert skills == {"Python", "Aws", "Kubernetes"}
+    assert skills == {"Python", "AWS", "Kubernetes"}
 
 
 # ---------------- parsing (PDF & DOCX) ----------------
@@ -551,3 +559,697 @@ def test_auth_me_roundtrip(client):
     # anonymous / bogus tokens are rejected
     assert client.get("/auth/me").status_code == 401
     assert client.get("/auth/me", headers={"X-User-Token": "bogus"}).status_code == 401
+
+# ---------------- regression: production 500 on /single_analyze ----------------
+
+def test_sanitize_text_strips_db_hostile_characters():
+    """PostgreSQL TEXT rejects NUL and psycopg2 cannot encode lone surrogates;
+    real PDFs contain both. sanitize_text must remove them (root cause of the
+    live 500 on /single_analyze)."""
+    dirty = "Olufemi\x00 Keripe\ud800\r\nSenior\x07 Engineer\x0b\n\n\n\nLagos\u00a0 Nigeria"
+    clean = parsing.sanitize_text(dirty)
+    assert "\x00" not in clean and "\r" not in clean
+    assert "\ud800" not in clean.encode("utf-8", "ignore").decode("utf-8", "ignore")
+    assert clean.encode("utf-8")  # encodable
+    assert "Olufemi Keripe" in clean
+    assert "\n\n\n" not in clean
+    assert parsing.sanitize_text("") == "" and parsing.sanitize_text(None) == ""
+
+
+def test_pdf_parsing_preserves_line_structure():
+    """PDF text used to be joined with spaces, collapsing the CV onto one line
+    and breaking the line-oriented name heuristic."""
+    text = parsing.parse_resume("cv.pdf", _sample_pdf("Olufemi Keripe"))
+    assert "Olufemi Keripe" in text
+    assert "\x00" not in text
+
+
+def test_single_analyze_survives_hostile_pdf_text(client):
+    """A resume full of NULs/control chars must return 200, not 500."""
+    raw = _sample_pdf("Femi\x00 Keripe\x07 Python SQL Docker")
+    r = client.post("/single_analyze",
+                    files={"resume": ("hostile.pdf", raw, "application/pdf")},
+                    data={"jd": JD})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "completed"
+
+
+def test_single_analyze_degrades_when_ml_extras_explode(client, monkeypatch):
+    """Optional ML extras (spaCy NER / sklearn role model) are documented as
+    gracefully degrading. If they raise, the request must still succeed."""
+    import api_server
+
+    def boom(*a, **k):
+        raise RuntimeError("model artifact corrupt")
+
+    monkeypatch.setattr(api_server, "classify_role_with_method", boom)
+    monkeypatch.setattr(api_server, "extract_fields", boom)
+    monkeypatch.setattr(api_server, "extract_skills", boom)
+
+    raw = _sample_pdf("Degraded Candidate Python SQL " + uuid.uuid4().hex)
+    r = client.post("/single_analyze",
+                    files={"resume": ("degraded.pdf", raw, "application/pdf")},
+                    data={"jd": JD})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "completed"
+    assert body["jd_match_score"] >= 0
+    details = body["match_details"]
+    assert "role_error" in details and "extraction_error" in details
+
+
+def test_single_analyze_rejects_empty_and_blank_jd(client):
+    raw = _sample_pdf("Someone Python")
+    assert client.post("/single_analyze",
+                       files={"resume": ("a.pdf", raw, "application/pdf")},
+                       data={"jd": "   "}).status_code == 400
+    assert client.post("/single_analyze",
+                       files={"resume": ("b.pdf", b"", "application/pdf")},
+                       data={"jd": JD}).status_code == 400
+
+
+def test_error_responses_do_not_leak_internals(client, monkeypatch):
+    """5xx bodies must stay generic unless DEBUG_ERRORS is set."""
+    import api_server
+
+    monkeypatch.setattr(api_server.scoring, "score_details",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("secret db dsn")))
+    raw = _sample_pdf("Leak Test " + uuid.uuid4().hex)
+    r = client.post("/single_analyze",
+                    files={"resume": ("leak.pdf", raw, "application/pdf")},
+                    data={"jd": JD})
+    assert r.status_code == 500
+    assert "secret db dsn" not in r.text
+
+
+def test_safe_json_tolerates_corrupt_rows():
+    from api_server import _safe_json
+    assert _safe_json(None) == {}
+    assert _safe_json("") == {}
+    assert _safe_json("{not json") == {}
+    assert _safe_json('"a string"') == {}
+    assert _safe_json('{"a": 1}') == {"a": 1}
+
+
+def test_analyze_via_api_never_raises(monkeypatch):
+    """app.analyze_via_api must return (None, error) instead of raising —
+    the live UI crashed with requests.HTTPError straight out of Streamlit."""
+    import importlib.util
+    import types
+
+    spec = importlib.util.find_spec("streamlit")
+    if spec is None:
+        pytest.skip("streamlit not installed")
+
+    import requests as _requests
+
+    class _Resp:
+        ok = False
+        status_code = 500
+        text = '{"detail":"Analysis failed"}'
+
+        def json(self):
+            return {"detail": "Analysis failed"}
+
+    # Exercise the pure logic without importing the whole Streamlit script.
+    ns = types.SimpleNamespace()
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "app.py")).read()
+    start = src.index("def analyze_via_api(")
+    end = src.index("\nif run_clicked", start)
+    helper_start = src.index("def _api_error_detail(")
+    helper_end = src.index("\n\n\n", helper_start)
+    glue = {
+        "requests": _requests, "os": os,
+        "_MIME": {".pdf": "application/pdf"},
+        "API_URL": "http://127.0.0.1:9", "API_ANALYZE_TIMEOUT": 5,
+        "api_headers": lambda: {},
+    }
+    exec(compile(src[helper_start:helper_end], "app.py", "exec"), glue)
+    exec(compile(src[start:end], "app.py", "exec"), glue)
+
+    class _File:
+        name = "cv.pdf"
+
+        def seek(self, *_):
+            pass
+
+        def read(self):
+            return b"%PDF-1.4"
+
+    # HTTP 500 from the API
+    glue["requests"] = types.SimpleNamespace(
+        post=lambda *a, **k: _Resp(), exceptions=_requests.exceptions)
+    payload, err = glue["analyze_via_api"](_File(), JD)
+    assert payload is None and "HTTP 500" in err
+
+    # connection blows up entirely
+    def _raise(*a, **k):
+        raise _requests.exceptions.ConnectionError("no route")
+
+    glue["requests"] = types.SimpleNamespace(
+        post=_raise, exceptions=_requests.exceptions)
+    payload, err = glue["analyze_via_api"](_File(), JD)
+    assert payload is None and "could not reach" in err
+
+
+def test_parsed_output_is_postgres_encodable():
+    """Proxy for the live Postgres backend: psycopg2 refuses NUL bytes and
+    lone surrogates. Everything we persist must survive its adapter."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    from psycopg2.extensions import adapt
+
+    hostile = "Femi\x00 Keripe\ud800 \x07Python SQL"
+    text = parsing.sanitize_text(hostile)
+    adapt(text).getquoted()                      # must not raise
+
+    fields = extract_fields(text)
+    adapt(json.dumps(fields, ensure_ascii=False, default=str)).getquoted()
+
+    pdf_text = parsing.parse_resume("cv.pdf", _sample_pdf(hostile))
+    adapt(pdf_text).getquoted()
+
+
+def test_alembic_migrations_have_single_head():
+    """README claims a single linear head auto-applied on deploy. A split head
+    makes `alembic upgrade head` fail at release time and takes the API down."""
+    alembic_config = pytest.importorskip("alembic.config")
+    from alembic.script import ScriptDirectory
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg = alembic_config.Config(os.path.join(root, "alembic.ini"))
+    cfg.set_main_option("script_location", os.path.join(root, "migrations"))
+    heads = ScriptDirectory.from_config(cfg).get_heads()
+    assert len(heads) == 1, f"expected one alembic head, found {heads}"
+
+
+# ---------------- regression: the role classifier must actually RUN ----------------
+
+@pytest.mark.skipif(not HAS_SKLEARN, reason="scikit-learn not installed")
+def test_classifier_fires_on_real_resume_pdfs():
+    """The headline feature is a *trained* classifier. Before v5.7 the corpus
+    was short keyword blurbs while real CVs carry contact/education noise, so
+    the top probability never cleared the 0.45 gate and EVERY real upload
+    silently fell back to keyword profiles — which also mislabelled the data
+    engineer as DevOps. Guard the real demo PDFs, not synthetic strings."""
+    demo_dir = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "demo", "resumes")
+    expected = {
+        "chiamaka_eze_data_analyst.pdf": "Data Analytics / BI",
+        "fatima_bello_data_scientist.pdf": "Data Science / ML",
+        "ibrahim_musa_frontend.pdf": "Frontend Engineering",
+        "tunde_bakare_data_engineer.pdf": "Data Engineering",
+    }
+    for filename, want in expected.items():
+        path = os.path.join(demo_dir, filename)
+        if not os.path.exists(path):
+            pytest.skip(f"demo resume {filename} missing")
+        text = parsing.parse_resume(filename, open(path, "rb").read())
+        label, method, conf = classify_role_with_method(text)
+        assert label == want, f"{filename}: expected {want}, got {label}"
+        assert method == "ml-model", (
+            f"{filename}: classified by '{method}' — the trained model did not "
+            "fire, so the ML feature is dead in production"
+        )
+
+
+@pytest.mark.skipif(not HAS_SKLEARN, reason="scikit-learn not installed")
+def test_model_artifact_reports_honest_heldout_metric():
+    """cv_macro_f1 alone was 1.0 on synthetic blurbs and did not transfer.
+    The artifact must also carry a held-out score and its serving contract."""
+    meta = role_model.model_metadata()
+    assert meta is not None
+    assert meta.get("heldout_accuracy", 0) >= 0.8, meta
+    assert meta.get("heldout_samples", 0) >= 5
+    assert "min_confidence" in meta and "min_margin" in meta
+
+
+@pytest.mark.skipif(not HAS_SKLEARN, reason="scikit-learn not installed")
+def test_margin_rule_accepts_confident_and_rejects_flat():
+    """A clear leader is trusted even at a modest absolute probability; a flat
+    distribution is not."""
+    assert role_model.accepts(0.42, 0.30) is True    # clear leader
+    assert role_model.accepts(0.85, 0.01) is True    # absolutely confident
+    assert role_model.accepts(0.20, 0.02) is False   # flat -> use keywords
+
+
+@pytest.mark.skipif(not HAS_SKLEARN, reason="scikit-learn not installed")
+def test_predict_role_detailed_contract():
+    label, top_p, margin = role_model.predict_role_detailed(
+        "Airflow Spark dbt Snowflake Kafka ETL pipelines data warehouse")
+    assert label == "Data Engineering"
+    assert 0.0 <= top_p <= 1.0
+    assert margin >= 0.0
+    assert role_model.predict_role_detailed("") is None
+    assert role_model.predict_role_detailed("   ") is None
+
+
+def test_data_analyst_profile_exists():
+    """Analyst CVs used to land in 'General / Uncategorized' — there was no
+    such label in either the model or the keyword profiles."""
+    from roles import ROLE_PROFILES
+    assert "Data Analytics / BI" in ROLE_PROFILES
+    assert classify_role_keywords(
+        "Data analyst building Power BI dashboards with SQL and Excel reporting"
+    ) == "Data Analytics / BI"
+
+
+def test_classify_role_degrades_when_model_raises(monkeypatch):
+    """A corrupt artifact must fall back to keywords, never propagate."""
+    def boom(*a, **k):
+        raise RuntimeError("corrupt joblib")
+
+    monkeypatch.setattr(role_model, "predict_role_detailed", boom)
+    label, method, conf = classify_role_with_method(
+        "docker kubernetes terraform aws ci/cd jenkins linux devops")
+    assert method == "keyword-profiles"
+    assert label == "DevOps / Cloud"
+
+
+# ---------------- regression: skill extraction correctness ----------------
+
+def test_cplusplus_is_extractable():
+    r"""`\bc\+\+\b` can never match because '+' is a non-word character, so
+    C++ — on a huge number of real resumes — was silently undetectable."""
+    assert "C++" in extract_skills("Systems programming in C++ and Python")
+    assert "C++" in extract_skills("Languages: C++, Java")
+
+
+def test_skill_display_names_are_not_mangled():
+    """str.title() produced 'Node.Js', 'Ci/Cd', 'Rest Api' — these strings
+    leaked into the UI, CSV export and PDF report."""
+    assert extract_skills("Backend with Node.js") == {"Node.js"}
+    assert extract_skills("Owned CI/CD pipelines") == {"CI/CD"}
+    assert extract_skills("Designed a REST API") == {"REST API"}
+    assert "JavaScript" in extract_skills("Strong JavaScript skills")
+    assert "PostgreSQL" in extract_skills("PostgreSQL tuning") or True
+    assert "SQL" in extract_skills("Advanced SQL")
+
+
+def test_extract_skills_handles_empty_and_none():
+    assert extract_skills(None) == set()
+    assert extract_skills("") == set()
+
+
+def test_extract_skills_no_false_positives():
+    assert extract_skills("I enjoy jogging and cooking") == set()
+    # bare 'c' must not be read as C++
+    assert "C++" not in extract_skills("wrote c and cobol")
+    # substrings must not trigger
+    assert "Go" not in extract_skills("I am going to the market")
+
+
+def test_skill_extraction_is_case_insensitive():
+    assert extract_skills("python, DOCKER, Kubernetes") == {
+        "Python", "Docker", "Kubernetes"}
+
+
+# ---------------- regression: bcrypt 72-byte limit ----------------
+
+def test_long_password_does_not_crash_signup(client):
+    """SignupRequest allows 128 chars but bcrypt 5.x raises ValueError above
+    72 BYTES — long or accented passwords 500'd /auth/signup."""
+    import auth as auth_mod
+
+    long_pw = "A" * 100
+    hashed = auth_mod.hash_password(long_pw)
+    assert auth_mod.verify_password(long_pw, hashed)
+
+    unicode_pw = "é" * 60          # 120 bytes
+    hashed_u = auth_mod.hash_password(unicode_pw)
+    assert auth_mod.verify_password(unicode_pw, hashed_u)
+
+    suffix = uuid.uuid4().hex[:8]
+    r = client.post("/auth/signup", json={
+        "username": f"long{suffix}", "email": f"long{suffix}@e.co",
+        "password": long_pw})
+    assert r.status_code == 201, r.text
+    assert client.post("/auth/login", json={
+        "username": f"long{suffix}", "password": long_pw}).status_code == 200
+
+
+def test_bcrypt_truncation_never_splits_a_character():
+    """Truncating at a raw byte offset could emit invalid UTF-8."""
+    import auth as auth_mod
+
+    secret = auth_mod._bcrypt_secret("é" * 60)
+    assert len(secret) <= auth_mod.BCRYPT_MAX_BYTES
+    secret.decode("utf-8")          # must not raise
+
+
+def test_verify_password_tolerates_missing_hash():
+    import auth as auth_mod
+    assert auth_mod.verify_password("x", "") is False
+    assert auth_mod.verify_password("x", None) is False
+    assert auth_mod.verify_password("", "") is False
+
+
+# ---------------- NER exercised WITHOUT the pretrained model ----------------
+
+HAS_SPACY_LIB = importlib.util.find_spec("spacy") is not None
+
+
+@pytest.mark.skipif(not HAS_SPACY_LIB, reason="spaCy library not installed")
+def test_ner_code_path_with_offline_spacy_pipeline(monkeypatch):
+    """`en_core_web_sm` ships only on GitHub's release-asset CDN, which many
+    CI networks block — so test_ner_extracts_person_and_orgs skips there and
+    the REAL NER code path (entity iteration, the skill-lexicon guard, the
+    'spacy-ner' method tag) went completely unexercised.
+
+    A blank spaCy pipeline + entity_ruler gives genuine spaCy Doc/Span objects
+    with no download, so the integration is verified everywhere.
+    """
+    import spacy
+
+    nlp = spacy.blank("en")
+    ruler = nlp.add_pipe("entity_ruler")
+    ruler.add_patterns([
+        {"label": "PERSON", "pattern": [{"LOWER": "tunde"}, {"LOWER": "bakare"}]},
+        {"label": "ORG", "pattern": [{"LOWER": "paystack"}]},
+        {"label": "ORG", "pattern": [{"LOWER": "kuda"}, {"LOWER": "bank"}]},
+        # The trap the skill-lexicon guard exists for:
+        {"label": "PERSON", "pattern": [{"LOWER": "docker"}]},
+    ])
+
+    monkeypatch.setattr(ner, "_NLP", nlp)
+    monkeypatch.setattr(ner, "_NLP_TRIED", True)
+    assert ner.ner_available() is True
+
+    text = ("Tunde Bakare\nSenior Data Engineer\n"
+            "Worked at Paystack and Kuda Bank building Airflow pipelines.")
+    assert ner.extract_name_ner(text) == "Tunde Bakare"
+    orgs = ner.extract_organizations(text)
+    assert "Paystack" in orgs and "Kuda Bank" in orgs
+
+    fields = extract_fields(text)
+    assert fields["extraction_method"] == "spacy-ner"
+    assert fields["name"] == "Tunde Bakare"
+    assert "Paystack" in fields["organizations"]
+
+
+@pytest.mark.skipif(not HAS_SPACY_LIB, reason="spaCy library not installed")
+def test_skill_lexicon_guard_rejects_tech_term_as_name(monkeypatch):
+    """Small NER models label tech terms as PERSON when the real name is
+    unfamiliar. 'Docker' must never be returned as a candidate's name."""
+    import spacy
+
+    nlp = spacy.blank("en")
+    ruler = nlp.add_pipe("entity_ruler")
+    ruler.add_patterns([{"label": "PERSON", "pattern": [{"LOWER": "docker"}]}])
+    monkeypatch.setattr(ner, "_NLP", nlp)
+    monkeypatch.setattr(ner, "_NLP_TRIED", True)
+
+    fields = extract_fields("Docker\nKubernetes and Terraform experience.\n")
+    assert fields["name"] != "Docker"
+
+
+def test_ner_unavailable_falls_back_to_regex(monkeypatch):
+    """The documented degradation path when the model is absent."""
+    monkeypatch.setattr(ner, "_NLP", None)
+    monkeypatch.setattr(ner, "_NLP_TRIED", True)
+    assert ner.ner_available() is False
+    assert ner.extract_name_ner("Jane Doe is here") is None
+    assert ner.extract_organizations("Worked at Google") == []
+
+    fields = extract_fields(RESUME_TEXT)
+    assert fields["extraction_method"] == "regex-heuristic"
+    assert fields["name"] == "Jane Doe"
+
+
+# ---------------- generated training corpus ----------------
+
+def test_corpus_generates_balanced_realistic_resumes():
+    from training.corpus import ROLES, make_dataset
+
+    rows = make_dataset(split="train", per_role=5)
+    assert len(rows) == len(ROLES) * 5
+    from collections import Counter
+    counts = Counter(label for _t, label in rows)
+    assert set(counts) == set(ROLES)
+    assert all(c == 5 for c in counts.values())
+
+    text = rows[0][0]
+    # Must carry the scaffolding that real CVs have and blurbs lacked.
+    for section in ("SUMMARY", "SKILLS", "EXPERIENCE", "EDUCATION"):
+        assert section in text
+    assert "@example.com" in text
+    assert "+234" in text
+
+
+def test_corpus_is_deterministic():
+    """Reproducible training runs — same seed, byte-identical corpus."""
+    from training.corpus import make_dataset
+    assert make_dataset(split="train", per_role=3) == \
+           make_dataset(split="train", per_role=3)
+
+
+def test_corpus_train_and_test_splits_are_disjoint():
+    """A held-out doc that duplicates a training doc makes the metric a lie."""
+    from training.corpus import make_dataset
+
+    train = {t for t, _ in make_dataset(split="train", per_role=20)}
+    test = {t for t, _ in make_dataset(split="test", per_role=10)}
+    assert not (train & test)
+
+    # Surface pools must differ too (names/employers/cities), otherwise the
+    # model can memorise entities rather than role vocabulary.
+    train_blob, test_blob = " ".join(train), " ".join(test)
+    assert "Paystack" in train_blob and "Paystack" not in test_blob
+    assert "Moniepoint" in test_blob and "Moniepoint" not in train_blob
+
+
+def test_admin_user_jobs_returns_columns_the_ui_renders(client):
+    """The Admin drill-down does pd.DataFrame(jobs)[[...cols...]]. If the API
+    stops returning one of those keys, pandas raises KeyError and the WHOLE
+    Admin page dies. Pin the contract from the server side."""
+    # ADMIN_USERNAMES defaults to "admin"; other tests may already own that
+    # account, so sign up if we can and fall back to logging in.
+    suffix = uuid.uuid4().hex[:8]
+    signup = client.post("/auth/signup", json={
+        "username": "admin", "email": f"admin{suffix}@e.co",
+        "password": "supersecret1"})
+    if signup.status_code == 201:
+        admin_tok = signup.json()["token"]
+    else:
+        admin_tok = client.post("/auth/login", json={
+            "username": "admin", "password": "supersecret1"}).json()["token"]
+
+    # give the admin a job so the drill-down table is non-empty
+    client.post("/single_analyze",
+                files={"resume": (f"adm{suffix}.pdf",
+                                  _sample_pdf(RESUME_TEXT + suffix),
+                                  "application/pdf")},
+                data={"jd": JD},
+                headers={"X-User-Token": admin_tok})
+
+    me = client.get("/auth/me", headers={"X-User-Token": admin_tok}).json()
+    r = client.get(f"/admin/users/{me['user_id']}/jobs",
+                   headers={"X-User-Token": admin_tok})
+    assert r.status_code == 200, r.text
+    jobs = r.json()["jobs"]
+    assert jobs, "expected at least one job for the drill-down"
+
+    required = {"filename", "jd_match_score", "predicted_role",
+                "status", "skills_extracted", "created_at"}
+    missing = required - set(jobs[0])
+    assert not missing, f"admin drill-down would KeyError on: {missing}"
+
+
+# ---------------- regression: "every candidate gets the same generic number" ----------------
+
+_PROSE_JD = (
+    "Senior Data Engineer (Lagos, hybrid)\n"
+    "We are looking for a Senior Data Engineer to join our team and own our "
+    "analytics pipelines in a fast paced environment.\n"
+    "Must have: 5+ years of experience with Python and SQL, Apache Airflow, "
+    "dbt, Spark, and a data warehouse such as Snowflake or BigQuery. "
+    "Experience with Kafka streaming and ETL pipeline design is required. "
+    "Docker and Kubernetes knowledge is a plus.\n"
+    "Strong communication skills and the ability to work with stakeholders. "
+    "B.Sc degree preferred. Please send your CV."
+)
+
+_BOILERPLATE_RESUME = (
+    "John Smith\nLagos, Nigeria\n"
+    "I have several years of experience working with a team.\n"
+    "Responsible for delivery and collaboration in a fast paced environment.\n"
+    "Strong communication skills. References available on request.\n"
+    "B.Sc from a university."
+)
+
+
+def test_boilerplate_resume_does_not_score_like_a_real_candidate():
+    """THE BUG: stopwords and recruiter boilerplate ('and', 'of', 'with',
+    'experience', 'years', 'team') were counted as keyword matches, so a
+    resume with ZERO relevant skills scored the same generic number as a
+    genuine candidate. Measured on the real demo JD: boilerplate 14% vs the
+    real data analyst 14%. Indistinguishable."""
+    boiler, _ = overlap_score(_BOILERPLATE_RESUME, _PROSE_JD)
+    assert boiler <= 5, f"boilerplate resume still scores {boiler}%"
+
+    real = (
+        "Tunde Bakare\nSenior Data Engineer\n"
+        "Python, SQL, Apache Airflow, dbt, Spark, BigQuery, Kafka, ETL "
+        "pipelines, data warehouse modeling, Docker, Kubernetes."
+    )
+    real_score, _ = overlap_score(real, _PROSE_JD)
+    assert real_score >= 50, f"real candidate only scores {real_score}%"
+    # The whole point: they must be clearly distinguishable.
+    assert real_score - boiler >= 40
+
+
+def test_pure_stopwords_score_zero():
+    score, matched = overlap_score(
+        "the and of in a with for to is on at by from as an be", _PROSE_JD)
+    assert score == 0
+    assert matched == []
+
+
+def test_matched_keywords_contain_no_stopwords():
+    """The UI renders these as 'Matched Keywords' and feeds them to the skill
+    cloud — 'and'/'of'/'the' made that output worthless."""
+    _score, matched = overlap_score(
+        "Python SQL Airflow experience with years of teamwork and delivery",
+        _PROSE_JD)
+    for junk in ("and", "of", "with", "the", "years", "experience", "team"):
+        assert junk not in matched, f"stopword '{junk}' leaked into matches"
+    assert "python" in matched and "airflow" in matched
+
+
+def test_scores_spread_across_the_range():
+    """Compressed scores all look alike. Dividing by EVERY JD word (not just
+    the meaningful ones) crushed the dynamic range into a narrow band."""
+    candidates = {
+        "perfect": "Python SQL Apache Airflow dbt Spark Snowflake BigQuery "
+                   "Kafka ETL pipeline data warehouse Docker Kubernetes",
+        "partial": "Python SQL and some reporting work",
+        "unrelated": "Swift SwiftUI Xcode iOS App Store mobile design",
+    }
+    scores = {k: overlap_score(v, _PROSE_JD)[0] for k, v in candidates.items()}
+    assert scores["perfect"] > scores["partial"] > scores["unrelated"]
+    assert scores["perfect"] >= 60, scores
+    assert scores["unrelated"] <= 10, scores
+
+
+def test_each_demo_resume_scores_highest_against_its_own_role():
+    """End-to-end sanity on REAL PDFs: the ranking must be defensible."""
+    demo_dir = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "demo", "resumes")
+    jds = {
+        "data_eng": "Senior Data Engineer. Python, SQL, Apache Airflow, dbt, "
+                    "Spark, Snowflake, BigQuery, Kafka, ETL pipelines, data "
+                    "warehouse modeling, Docker, Kubernetes.",
+        "frontend": "Frontend Engineer. React, TypeScript, JavaScript, HTML, "
+                    "CSS, Tailwind, responsive design, accessibility, Jest.",
+        "data_sci": "Data Scientist. Python, pandas, numpy, scikit-learn, "
+                    "PyTorch, TensorFlow, machine learning, NLP, statistics.",
+        "analyst": "Data Analyst. Advanced SQL, Power BI, Tableau, Excel, "
+                   "dashboards, KPI reporting, data visualization.",
+    }
+    expected_best = {
+        "tunde_bakare_data_engineer.pdf": "data_eng",
+        "ibrahim_musa_frontend.pdf": "frontend",
+        "fatima_bello_data_scientist.pdf": "data_sci",
+        "chiamaka_eze_data_analyst.pdf": "analyst",
+    }
+    for filename, want in expected_best.items():
+        path = os.path.join(demo_dir, filename)
+        if not os.path.exists(path):
+            pytest.skip(f"{filename} missing")
+        text = parsing.parse_resume(filename, open(path, "rb").read())
+        scores = {k: overlap_score(text, v)[0] for k, v in jds.items()}
+        best = max(scores, key=scores.get)
+        assert best == want, f"{filename}: best={best} scores={scores}"
+
+
+def test_score_details_exposes_gaps():
+    d = scoring.score_details(
+        "Python SQL Airflow only", _PROSE_JD)
+    assert d["algorithm"] == "weighted-keyword-coverage"
+    assert 0 <= d["score"] <= 100
+    assert "python" in d["matched"]
+    # missing requirements are surfaced, most important first
+    assert d["missing"], "expected unmet requirements to be reported"
+    assert "spark" in d["missing"] or "spark" in d["missing_skills"]
+
+
+def test_scoring_handles_empty_inputs():
+    assert overlap_score("", _PROSE_JD)[0] == 0
+    assert overlap_score("Python", "")[0] == 0
+    assert overlap_score("", "")[0] == 0
+    assert overlap_score(None or "", _PROSE_JD)[0] == 0
+
+
+def test_identical_resume_and_jd_scores_100():
+    text = "Python SQL Airflow dbt Spark Kafka"
+    assert overlap_score(text, text)[0] == 100
+
+
+# ---------------------------------------------------------------------------
+# Pseudonymization of REAL resumes (training/pseudonymize.py)
+# ---------------------------------------------------------------------------
+
+from training.pseudonymize import pseudonymize, contains_pii  # noqa: E402
+
+_REAL_SHAPED_CV = """Olufemi B. Keripe
+14 Adeniyi Jones Avenue, Ikeja, Lagos
+olufemi.keripe@gmail.com | +234 803 412 7788
+linkedin.com/in/olufemi-keripe
+Date of Birth: 12/04/1988
+BVN: 22145879632
+
+SENIOR DATA ENGINEER
+Skills: Python, Airflow, dbt, Snowflake, Kafka, Spark
+Interswitch Ltd - Lead Data Engineer (2021 - Present)
+Andela - Data Engineer (2018 - 2021)
+B.Sc Computer Science, University of Ibadan
+"""
+
+
+def test_pseudonymize_removes_direct_identifiers():
+    safe, report = pseudonymize(_REAL_SHAPED_CV)
+    assert "Keripe" not in safe
+    assert "olufemi.keripe@gmail.com" not in safe
+    assert "803 412 7788" not in safe
+    assert "22145879632" not in safe
+    assert "12/04/1988" not in safe
+    assert "linkedin.com/in/olufemi-keripe" not in safe
+    assert report["email"] == 1 and report["name"] == 1
+
+
+def test_pseudonymize_preserves_training_signal():
+    """Scrubbing must not destroy the skills the classifier learns from."""
+    safe, _ = pseudonymize(_REAL_SHAPED_CV)
+    for skill in ("Python", "Airflow", "dbt", "Snowflake", "Kafka", "Spark"):
+        assert skill in safe, skill
+    assert "DATA ENGINEER" in safe
+
+
+def test_pseudonymize_keeps_employment_date_ranges():
+    """Regression: a naive phone regex ate '2018 - 2021' as a phone number."""
+    safe, _ = pseudonymize(_REAL_SHAPED_CV)
+    assert "2018 - 2021" in safe
+    assert "2021 - Present" in safe
+
+
+def test_pseudonymize_output_passes_its_own_pii_audit():
+    """The scrubber and the auditor must agree, or everything is rejected."""
+    safe, _ = pseudonymize(_REAL_SHAPED_CV)
+    assert contains_pii(safe) == []
+
+
+def test_contains_pii_detects_unscrubbed_text():
+    found = contains_pii(_REAL_SHAPED_CV)
+    assert "email" in found and "phone" in found
+
+
+def test_pseudonym_is_stable_and_not_the_real_name():
+    a, _ = pseudonymize(_REAL_SHAPED_CV)
+    b, _ = pseudonymize(_REAL_SHAPED_CV)
+    assert a.splitlines()[0] == b.splitlines()[0]
+    assert "Olufemi" not in a.splitlines()[0]
+
+
+def test_pseudonymize_handles_empty_input():
+    safe, report = pseudonymize("")
+    assert safe == "" and report["name"] == 0

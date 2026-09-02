@@ -16,8 +16,10 @@ Endpoints:
 import base64
 import datetime as dt
 import json
+import logging
 import os
 import time
+import traceback
 import uuid
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
@@ -25,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 import auth
 import monitoring
@@ -33,13 +36,25 @@ from database import SessionLocal
 from extractors import extract_fields
 from models import JobStatus, ResumeResult, User
 from roles import classify_role_with_method
+import scoring
 from scoring import overlap_score
 from skills import extract_skills
 from tasks import make_dedup_hash
 
-app = FastAPI(title="Resume Classifier API (Sync)", version="5.6.0")
+logger = logging.getLogger("resumerank.api")
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+
+app = FastAPI(title="Resume Classifier API (Sync)", version="5.7.0")
 
 MAX_RESUME_BYTES = 10 * 1024 * 1024  # 10 MB safety cap
+MAX_JD_CHARS = 20000                 # pasted-JD sanity cap
+MAX_RESUME_CHARS = 200000            # parsed-text sanity cap (Postgres TEXT)
+
+# Set DEBUG_ERRORS=1 to echo the exception type/message in 5xx responses.
+DEBUG_ERRORS = os.environ.get("DEBUG_ERRORS", "0").lower() in ("1", "true", "yes")
 
 ADMIN_USERNAMES = {
     u.strip().lower()
@@ -176,9 +191,28 @@ def signup(payload: SignupRequest):
             is_admin=_is_admin_name(payload.username),
         )
         db.add(user)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # Two signups for the same username/email raced past the SELECT
+            # above and collided on the unique index. That is a client-visible
+            # conflict, not a server fault.
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="Username or email already registered",
+            )
         db.refresh(user)
         return _user_payload(user)
+    except HTTPException:
+        raise
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("signup failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Storage backend unavailable, please retry in a moment.",
+        )
     finally:
         db.close()
 
@@ -224,6 +258,31 @@ def auth_me(x_user_token: str | None = Header(default=None)):
 
 # ------------------------------- analysis (SYNCHRONOUS DIRECT) --------------------------------
 
+def _safe_json(raw):
+    """Stored JSON columns are read back defensively: one legacy/truncated row
+    must never take down /single_analyze, /results or /history with a 500."""
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return value if isinstance(value, (dict, list)) else {}
+
+
+def _completed_payload(job, duplicate: bool) -> dict:
+    return {
+        "job_id": job.job_id,
+        "status": "completed",
+        "jd_match_score": job.jd_match_score,
+        "skills_extracted": job.skills_extracted,
+        "predicted_role": job.predicted_role,
+        "extracted_fields": _safe_json(job.extracted_fields),
+        "match_details": _safe_json(job.match_details),
+        "duplicate": duplicate,
+    }
+
+
 @app.post("/single_analyze", status_code=200)
 async def single_analyze(
     resume: UploadFile = File(...),
@@ -246,6 +305,15 @@ async def single_analyze(
 
     if len(payload) > MAX_RESUME_BYTES:
         raise HTTPException(status_code=413, detail="Resume exceeds 10 MB limit.")
+    if not payload:
+        raise HTTPException(status_code=400, detail=f"'{filename}' is empty.")
+
+    # The JD is user-typed and lands in a Postgres TEXT column: scrub NULs /
+    # lone surrogates here too, and cap it so a pasted novel can't blow up the
+    # row. Hash the SANITIZED jd so dedup stays consistent with what's stored.
+    jd = parsing.sanitize_text(jd)[:MAX_JD_CHARS]
+    if not jd:
+        raise HTTPException(status_code=400, detail="Job description is empty.")
 
     user_id = _current_user_id(x_user_token) if x_user_token else None
     dedup_hash = make_dedup_hash(payload, jd)
@@ -260,16 +328,7 @@ async def single_analyze(
             if user_id and not existing.user_id:
                 existing.user_id = user_id
                 db.commit()
-            return {
-                "job_id": existing.job_id,
-                "status": "completed",
-                "jd_match_score": existing.jd_match_score,
-                "skills_extracted": existing.skills_extracted,
-                "predicted_role": existing.predicted_role,
-                "extracted_fields": json.loads(existing.extracted_fields) if existing.extracted_fields else {},
-                "match_details": json.loads(existing.match_details) if existing.match_details else {},
-                "duplicate": True,
-            }
+            return _completed_payload(existing, duplicate=True)
 
         try:
             text = parsing.parse_resume(filename, payload)
@@ -288,17 +347,50 @@ async def single_analyze(
                 detail=f"No readable text in '{filename}'. Scanned image PDFs "
                        "need OCR before upload.",
             )
-        keyword_score, _overlap = overlap_score(text, jd)
-        role, role_method, role_confidence = classify_role_with_method(text)
-        extracted = extract_fields(text)
-        skills = ", ".join(sorted(extract_skills(text)))
+        text = parsing.sanitize_text(text)[:MAX_RESUME_CHARS]
 
+        breakdown = scoring.score_details(text, jd)
+        keyword_score = breakdown["score"]
+
+        # The ML extras (spaCy NER, sklearn role model) are OPTIONAL by design
+        # (README: "graceful degradation"). A missing model file, an OOM-killed
+        # spaCy load or a corrupt joblib artifact must degrade the result, not
+        # 500 the request — this was the production failure mode.
+        # Surface WHY a candidate scored what they did — matched vs missing
+        # requirements make the number explainable instead of arbitrary.
         details = {
-            "algorithm": "keyword-overlap",
+            "algorithm": breakdown["algorithm"],
             "keyword_score": keyword_score,
-            "role_method": role_method,
-            "role_confidence": role_confidence,
+            "coverage": breakdown["coverage"],
+            "jd_terms": breakdown["jd_terms"],
+            "matched_terms": breakdown["matched"][:40],
+            "missing_terms": breakdown["missing"][:25],
+            "matched_skills": breakdown["matched_skills"],
+            "missing_skills": breakdown["missing_skills"],
         }
+
+        try:
+            role, role_method, role_confidence = classify_role_with_method(text)
+        except Exception as exc:
+            logger.warning("role classification failed for %s: %s", filename, exc)
+            role, role_method, role_confidence = "General / Uncategorized", "unavailable", None
+            details["role_error"] = f"{type(exc).__name__}: {exc}"
+        details["role_method"] = role_method
+        details["role_confidence"] = role_confidence
+
+        try:
+            extracted = extract_fields(text)
+        except Exception as exc:
+            logger.warning("field extraction failed for %s: %s", filename, exc)
+            extracted = {"extraction_method": "unavailable"}
+            details["extraction_error"] = f"{type(exc).__name__}: {exc}"
+
+        try:
+            skills = ", ".join(sorted(extract_skills(text)))
+        except Exception as exc:
+            logger.warning("skill extraction failed for %s: %s", filename, exc)
+            skills = ""
+            details["skills_error"] = f"{type(exc).__name__}: {exc}"
 
         job_id = existing.job_id if existing else str(uuid.uuid4())
         
@@ -321,8 +413,8 @@ async def single_analyze(
         job.jd_match_score = keyword_score
         job.skills_extracted = skills
         job.predicted_role = role
-        job.extracted_fields = json.dumps(extracted)
-        job.match_details = json.dumps(details)
+        job.extracted_fields = json.dumps(extracted, ensure_ascii=False, default=str)
+        job.match_details = json.dumps(details, ensure_ascii=False, default=str)
         job.status = JobStatus.COMPLETED
         if user_id:
             job.user_id = user_id
@@ -342,9 +434,38 @@ async def single_analyze(
         # client errors (400 bad file, etc.) must not be rewritten to 500
         db.rollback()
         raise
+    except IntegrityError:
+        # Two identical resumes submitted concurrently (batch screening races
+        # on the resume_hash unique index). The other request won — serve its
+        # completed row instead of failing the user's upload.
+        db.rollback()
+        winner = db.query(ResumeResult).filter(
+            ResumeResult.resume_hash == dedup_hash
+        ).first()
+        if winner is not None:
+            return _completed_payload(winner, duplicate=True)
+        logger.exception("dedup race with no winning row for %s", filename)
+        raise HTTPException(status_code=409, detail="Duplicate submission in flight; retry.")
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("DB failure analyzing %s: %s\n%s", filename, exc,
+                     traceback.format_exc())
+        raise HTTPException(
+            status_code=503,
+            detail="Storage backend unavailable, please retry in a moment."
+                   + (f" [{type(exc).__name__}: {exc}]" if DEBUG_ERRORS else ""),
+        )
     except Exception as exc:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(exc)}")
+        # Always log the full traceback server-side; the client gets a stable,
+        # non-leaky message unless DEBUG_ERRORS is on.
+        logger.error("Analysis failed for %s: %s\n%s", filename, exc,
+                     traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail="Analysis failed due to an internal error."
+                   + (f" [{type(exc).__name__}: {exc}]" if DEBUG_ERRORS else ""),
+        )
     finally:
         db.close()
 
@@ -363,8 +484,8 @@ def get_results(job_id: str):
             "jd_match_score": job.jd_match_score,
             "skills_extracted": job.skills_extracted,
             "predicted_role": job.predicted_role,
-            "extracted_fields": json.loads(job.extracted_fields) if job.extracted_fields else {},
-            "match_details": json.loads(job.match_details) if job.match_details else {},
+            "extracted_fields": _safe_json(job.extracted_fields),
+            "match_details": _safe_json(job.match_details),
             "created_at": job.created_at.isoformat() if job.created_at else None,
         }
     finally:
@@ -393,7 +514,7 @@ def history(x_user_token: str | None = Header(default=None)):
                     "jd_match_score": j.jd_match_score,
                     "skills_extracted": j.skills_extracted,
                     "predicted_role": j.predicted_role,
-                    "extracted_fields": json.loads(j.extracted_fields) if j.extracted_fields else {},
+                    "extracted_fields": _safe_json(j.extracted_fields),
                     "created_at": j.created_at.isoformat() if j.created_at else None,
                 }
                 for j in jobs
@@ -598,6 +719,9 @@ def admin_user_jobs(uid: int, x_user_token: str | None = Header(default=None)):
                     "status": j.status.value,
                     "jd_match_score": j.jd_match_score,
                     "predicted_role": j.predicted_role,
+                    # The admin drill-down table renders this column; omitting
+                    # it made the whole Admin page crash with a pandas KeyError.
+                    "skills_extracted": j.skills_extracted,
                     "created_at": j.created_at.isoformat() if j.created_at else None,
                 }
                 for j in jobs
