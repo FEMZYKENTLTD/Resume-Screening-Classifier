@@ -1010,10 +1010,16 @@ if page == "🛠 Admin":
                 if jobs_resp.ok:
                     ujobs = jobs_resp.json()["jobs"]
                     if ujobs:
-                        st.dataframe(pd.DataFrame(ujobs)[
-                            ["filename", "jd_match_score", "predicted_role",
-                             "status", "skills_extracted", "created_at"]],
-                            width="stretch")
+                        # Select defensively: hard-indexing a column the API
+                        # does not return raises a pandas KeyError and takes
+                        # down the entire Admin page.
+                        _udf = pd.DataFrame(ujobs)
+                        _cols = [c for c in ("filename", "jd_match_score",
+                                             "predicted_role", "status",
+                                             "skills_extracted", "created_at")
+                                 if c in _udf.columns]
+                        st.dataframe(_udf[_cols] if _cols else _udf,
+                                     width="stretch")
                     else:
                         st.caption(f"{choice['username']} has no analyses yet.")
     footer()

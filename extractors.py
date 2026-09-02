@@ -37,6 +37,16 @@ _EDUCATION_KEYWORDS = (
 )
 
 
+def _plausible_name(name) -> bool:
+    """Sanity-check an NER-detected name. Small NER models love labelling
+    tech terms ("Docker", "Kubernetes") as PERSON when the real name is
+    unfamiliar to them — never let a known skill word pass as a name."""
+    if not name:
+        return False
+    words = [w.lower().strip(".,") for w in str(name).split()]
+    return not any(w in _SKILL_LEXICON for w in words)
+
+
 def extract_email(text: str):
     m = EMAIL_RE.search(text or "")
     return m.group(0) if m else None
@@ -65,6 +75,11 @@ def extract_name(text: str):
         words = line.split()
         if not 1 <= len(words) <= 4:
             continue
+        # A known tech skill is never a person's name. Without this the regex
+        # fallback happily returned "Docker"/"Python" as the candidate name --
+        # including right after the NER guard had rejected exactly that value.
+        if not _plausible_name(line):
+            continue
         if all(w[0].isupper() for w in words if w and w[0].isalpha()):
             if not any(ch.isdigit() for ch in line):
                 return line
@@ -85,16 +100,6 @@ def extract_education(text: str):
         if re.search(r"\b" + re.escape(kw) + r"\b", (text or "").lower()):
             found.add(kw.upper() if len(kw) <= 4 else kw.title())
     return sorted(found)
-
-
-def _plausible_name(name) -> bool:
-    """Sanity-check an NER-detected name. Small NER models love labelling
-    tech terms ("Docker", "Kubernetes") as PERSON when the real name is
-    unfamiliar to them — never let a known skill word pass as a name."""
-    if not name:
-        return False
-    words = [w.lower().strip(".,") for w in str(name).split()]
-    return not any(w in _SKILL_LEXICON for w in words)
 
 
 def extract_fields(text: str) -> dict:

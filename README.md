@@ -15,7 +15,7 @@ Prometheus/Grafana observability — all deployable with one command.
 ![Postgres](https://img.shields.io/badge/Database-PostgreSQL-336791?style=for-the-badge&logo=postgresql&logoColor=white)
 
 [![CI](https://github.com/FEMZYKENTLTD/Resume-Screening-Classifier/actions/workflows/deploy.yml/badge.svg)](https://github.com/FEMZYKENTLTD/Resume-Screening-Classifier/actions/workflows/deploy.yml)
-![Tests](https://img.shields.io/badge/Tests-58%20unit%20%2B%2021%20live%20E2E-brightgreen?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Tests-65%20unit%20%2B%2021%20live%20E2E-brightgreen?style=for-the-badge)
 ![Docker](https://img.shields.io/badge/Docker-Compose%20Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 ![Status](https://img.shields.io/badge/Status-Production%20Ready-blueviolet?style=for-the-badge)
@@ -97,7 +97,7 @@ Streamlit UI  ──POST /single_analyze──▶  FastAPI  ──▶ parse → 
 | Feature | Detail |
 |---|---|
 | 🗣 **True NER** | spaCy `en_core_web_sm` → PERSON / ORG extraction, with a **skill-lexicon guard** (stops "Docker" being read as a name 😅) and regex fallback when the model isn't installed |
-| 🧑‍💼 **Trained role classifier** | TF-IDF + logistic regression over **9 role families** (`models/role_classifier.joblib`, committed artifact, auditable corpus in `training/`). Accepts the ML vote on **confidence *or* margin over the runner-up**; keyword profiles as fallback. Validated on a held-out, resume-shaped set — **6/6**, and **4/4** on the real demo PDFs |
+| 🧑‍💼 **Trained role classifier** | TF-IDF + logistic regression over **9 role families**, trained on **619 resume-shaped documents** (`training/corpus.py` generator + curated rows). Accepts the ML vote on **confidence *or* margin over the runner-up**. Held-out accuracy **100% over 141 unseen docs**, **4/4** on the real demo PDFs, **6/6** on deliberately ambiguous overlap cases |
 | ♻️ **Smart duplicate detection** | identical resume + identical JD short-circuits to the cached analysis (API check + unique DB index) — watch the "smart cache hit" badge |
 | 🛡 **Graceful degradation** | spaCy / sentence-transformers / scikit-learn are **optional extras** — base images stay lean, features fall back cleanly |
 
@@ -350,9 +350,10 @@ Interactive docs: **`/docs`** on the API (Swagger UI).
 Everything claimed above is **machine-verified**, not vibes:
 
 ```bash
-pytest tests/ -q                     # 59 tests — full stack on SQLite + eager Celery
-                                     #   • with scikit-learn installed: 58 passed, 1 spaCy-model skip
-                                     #   • bare CI (no ML extras):      52 passed, 7 auto-skips
+pytest tests/ -q                     # 66 tests — full stack on SQLite + eager Celery
+                                     #   • with spaCy + scikit-learn:   65 passed, 1 model-only skip
+                                     #   • bare CI (no ML extras):      57 passed, 9 auto-skips
+python -m training.train_role_classifier   # retrain + REFUSE to ship a bad model
 python scripts/verify_ui_live.py     # 21 passed — drives the REAL running stack:
                                      # HTTP login → PDF through the pipeline → AppTest on every page
 ```
@@ -437,6 +438,58 @@ Three independent defects combined to produce it:
   `Analysis failed for <file>` line with the full traceback for any residual
   failure.
 
+### `en_core_web_sm` fails to install (blocked GitHub CDN)
+
+**Short answer: it does not break anything — but you should still fix it, because
+without it you lose real NER.**
+
+spaCy models are *not* on PyPI. They are published as GitHub **release assets**,
+served from a different host than `github.com`:
+
+```
+github.com                         ✅ usually allowed
+release-assets.githubusercontent.com   ❌ often blocked by proxies/CI egress
+```
+
+The Dockerfiles used to pin that URL inside the same `RUN pip install` layer as
+everything else, so a blocked CDN **failed the entire image build** — for a
+feature that is documented as optional. That is now fixed:
+`scripts/install_spacy_model.sh` tries `python -m spacy download` first, falls
+back to the pinned URL, verifies the model actually loads, and **exits 0 either
+way** so a deploy can never die over an optional extra.
+
+**What you lose if the model is genuinely absent**
+
+| | With `en_core_web_sm` | Without |
+|---|---|---|
+| Candidate name | spaCy `PERSON` entity | regex heuristic (first Title-Case line) |
+| Organizations | spaCy `ORG` entities | *empty list* |
+| `extraction_method` | `spacy-ner` | `regex-heuristic` |
+| Scoring, role, skills, dedup | unaffected | unaffected |
+
+So: screening keeps working and nothing 500s, but **employer extraction goes
+away** and name detection gets weaker on unusual layouts. Check which mode you
+are in with `extracted_fields.extraction_method` in any API response.
+
+**Fixing it in a restricted network** — pick whichever fits:
+
+```bash
+# 1. allowlist the asset host, then rebuild
+#    release-assets.githubusercontent.com, objects.githubusercontent.com
+
+# 2. vendor the wheel and install from your own storage / build context
+pip download en_core_web_sm --no-deps -d vendor/    # on an unrestricted machine
+pip install vendor/en_core_web_sm-3.8.0-py3-none-any.whl
+
+# 3. force the build to fail loudly instead of shipping without NER
+docker build --build-arg SPACY_MODEL_REQUIRED=1 -f Dockerfile.api .
+```
+
+> 🧪 The NER **code path** is tested regardless: `test_ner_code_path_with_offline_spacy_pipeline`
+> builds a blank spaCy pipeline with an `entity_ruler`, producing genuine
+> `Doc`/`Span` objects with no download. Only the pretrained *weights* are
+> unavailable offline, so the integration never goes unverified.
+
 ### Other common issues
 
 | Symptom | Cause / fix |
@@ -475,6 +528,36 @@ Three independent defects combined to produce it:
 - API **and** worker expose `/metrics` (request latency, task throughput, failures)
 - Compose stack includes **Prometheus** (pre-configured scrape targets) and **Grafana**
   with a provisioned *ResumeRank Overview* dashboard — zero clicks to graphs
+
+---
+
+## 🆕 What's new in v5.8 — the classifier gets a real corpus
+
+- 📚 **619-document training corpus** (`training/corpus.py`) — a seeded, reproducible
+  generator that emits **resume-shaped** documents: name, contact line, title, summary,
+  dated employment history with employers, skills line, degree, and soft-skill filler.
+  That scaffolding is the realistic noise the old 56 keyword blurbs completely lacked
+- 🎯 **Confidence roughly doubled on the real demo PDFs** — 0.43→0.55, 0.52→0.75,
+  0.39→0.61, 0.42→0.73, all four still correct and all served by the ML model
+- 🧩 **6/6 on deliberately ambiguous overlap cases** — including the Data-Engineering
+  resume loaded with Docker/Kubernetes/CI/CD that originally misfired as *DevOps*
+- 🚧 **Train/test splits are provably disjoint** — different seeds *and* disjoint pools
+  of names, employers and cities, so a held-out doc can never echo a training doc
+- 🛑 **The training script refuses to ship a bad model.** It hard-fails if held-out
+  accuracy < 0.80, if the hand-written probes regress, if the **real demo PDFs** are not
+  100% correct, or if the **serving rule would accept < 95%** of held-out docs. That last
+  gate is the one that would have caught the original bug, where the model was accurate
+  but too flat to ever be used
+- 📈 **Per-class reporting** — accuracy, mean confidence and mean margin for all 9 roles,
+  so one broken class can't hide behind a good average
+- 🕵️ **NER guard hole closed** — the skill-lexicon check rejected "Docker" as a name in
+  the spaCy path, but the **regex fallback happily re-introduced it**. Both paths guarded
+- 🧨 **Admin page crash fixed** — `/admin/users/{id}/jobs` never returned
+  `skills_extracted`, yet the drill-down hard-indexed that column, so the whole Admin
+  page died with a pandas `KeyError` for any admin who had run a job. API now returns it
+  and the UI selects columns defensively
+- 🌐 **spaCy model install no longer risks the build** — see
+  [Troubleshooting](#en_core_web_sm-fails-to-install-blocked-github-cdn)
 
 ---
 

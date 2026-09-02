@@ -709,6 +709,9 @@ def admin_user_jobs(uid: int, x_user_token: str | None = Header(default=None)):
                     "status": j.status.value,
                     "jd_match_score": j.jd_match_score,
                     "predicted_role": j.predicted_role,
+                    # The admin drill-down table renders this column; omitting
+                    # it made the whole Admin page crash with a pandas KeyError.
+                    "skills_extracted": j.skills_extracted,
                     "created_at": j.created_at.isoformat() if j.created_at else None,
                 }
                 for j in jobs

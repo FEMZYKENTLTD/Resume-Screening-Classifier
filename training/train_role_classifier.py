@@ -35,6 +35,15 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from training.corpus import ROLES as CORPUS_ROLES  # noqa: E402
+from training.corpus import make_dataset  # noqa: E402
+
+# Synthetic resume-shaped documents (see training/corpus.py). These dominate
+# the corpus by volume and are what teach the model to ignore the contact /
+# education / employer scaffolding that every real CV carries.
+GENERATED_PER_ROLE = int(os.environ.get("GENERATED_PER_ROLE", "60"))
+GENERATED_TEST_PER_ROLE = int(os.environ.get("GENERATED_TEST_PER_ROLE", "15"))
+
 DATA = [
     # Data Science / ML
     ("Built machine learning models with pandas numpy scikit-learn. Deep learning with tensorflow and keras. NLP and computer vision projects, statistical prediction analytics for data science team.", "Data Science / ML"),
@@ -217,6 +226,19 @@ HELDOUT = [
      "quality assurance release checklists.\nB.Sc Computer Science, BUK.", "QA / Testing"),
 ]
 
+# Curated (hand-written) rows above + generated resume-shaped rows below.
+# Keeping both matters: the curated rows pin exact vocabulary we care about,
+# the generated rows supply realistic volume and scaffolding noise.
+CURATED = list(DATA)
+GENERATED = make_dataset(split="train", per_role=GENERATED_PER_ROLE)
+DATA = CURATED + GENERATED
+
+# A second, fully held-out generated set drawn from DISJOINT name/employer/
+# city pools and a different seed, plus the hand-written HELDOUT probes.
+GENERATED_HELDOUT = make_dataset(split="test", per_role=GENERATED_TEST_PER_ROLE)
+HELDOUT_CURATED = list(HELDOUT)
+HELDOUT = HELDOUT_CURATED + GENERATED_HELDOUT
+
 MODEL_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models"
 )
@@ -259,6 +281,73 @@ def evaluate_heldout(pipeline):
     return correct / len(HELDOUT), rows
 
 
+def _per_class_report(rows):
+    """Accuracy and mean margin per role — a single headline number can hide
+    one class being completely broken."""
+    from collections import defaultdict
+    agg = defaultdict(lambda: {"n": 0, "ok": 0, "margin": 0.0, "top_p": 0.0})
+    for expected, _got, top_p, margin, ok in rows:
+        a = agg[expected]
+        a["n"] += 1
+        a["ok"] += bool(ok)
+        a["margin"] += margin
+        a["top_p"] += top_p
+    return agg
+
+
+def _serving_acceptance(rows, min_conf, min_margin):
+    """Fraction of held-out docs the SERVING rule would actually accept from
+    the model (rather than silently dropping to keyword profiles). This is the
+    metric whose collapse caused the original production bug."""
+    accepted = sum(1 for _e, _g, p, m, _ok in rows if p >= min_conf or m >= min_margin)
+    accepted_correct = sum(
+        1 for _e, _g, p, m, ok in rows
+        if (p >= min_conf or m >= min_margin) and ok
+    )
+    return accepted / len(rows), (accepted_correct / accepted if accepted else 0.0)
+
+
+def _score_real_demo_resumes(pipeline):
+    """Classify the committed demo PDFs — genuine documents produced outside
+    this training script. Returns accuracy, or None if unavailable."""
+    try:
+        import parsing
+    except Exception:
+        return None
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    demo_dir = os.path.join(root, "demo", "resumes")
+    expected = {
+        "chiamaka_eze_data_analyst.pdf": "Data Analytics / BI",
+        "fatima_bello_data_scientist.pdf": "Data Science / ML",
+        "ibrahim_musa_frontend.pdf": "Frontend Engineering",
+        "tunde_bakare_data_engineer.pdf": "Data Engineering",
+    }
+    seen = correct = 0
+    for filename, want in expected.items():
+        path = os.path.join(demo_dir, filename)
+        if not os.path.exists(path):
+            continue
+        try:
+            text = parsing.parse_resume(filename, open(path, "rb").read())
+        except Exception:
+            continue
+        seen += 1
+        proba = pipeline.predict_proba([text])[0]
+        order = sorted(zip(pipeline.classes_, proba), key=lambda kv: -kv[1])
+        got, top_p = str(order[0][0]), float(order[0][1])
+        margin = top_p - (float(order[1][1]) if len(order) > 1 else 0.0)
+        # Must be right AND actually servable under the production rule.
+        servable = top_p >= 0.40 or margin >= 0.10
+        correct += (got == want and servable)
+        if got != want:
+            print(f"    MISS {filename}: expected {want}, got {got}")
+        elif not servable:
+            print(f"    WEAK {filename}: correct ({got}) but p={top_p:.3f} "
+                  f"margin={margin:.3f} would fall back to keywords")
+    return (correct / seen) if seen else None
+
+
 def main():
     import joblib
     from sklearn.model_selection import StratifiedKFold, cross_val_score
@@ -275,10 +364,19 @@ def main():
     pipeline.fit(texts, labels)
 
     heldout_acc, rows = evaluate_heldout(pipeline)
-    print(f"held-out accuracy (resume-shaped, unseen): {heldout_acc:.3f}")
-    print(f"  {'expected':<22}{'predicted':<22}{'top_p':>7}{'margin':>8}")
-    for expected, got, top_p, margin, ok in rows:
-        print(f"  {expected:<22}{got:<22}{top_p:>7.3f}{margin:>8.3f}  {'OK' if ok else 'MISS'}")
+    print(f"held-out accuracy (resume-shaped, unseen): {heldout_acc:.3f} "
+          f"over {len(rows)} documents")
+
+    agg = _per_class_report(rows)
+    print(f"  {'role':<24}{'n':>4}{'acc':>8}{'mean_p':>9}{'mean_margin':>13}")
+    for role in sorted(agg):
+        a = agg[role]
+        print(f"  {role:<24}{a['n']:>4}{a['ok']/a['n']:>8.3f}"
+              f"{a['top_p']/a['n']:>9.3f}{a['margin']/a['n']:>13.3f}")
+
+    accept_rate, accept_prec = _serving_acceptance(rows, 0.40, 0.10)
+    print(f"  serving rule accepts {accept_rate:.1%} of held-out docs "
+          f"(precision when accepted: {accept_prec:.1%})")
 
     min_margin = min(r[3] for r in rows)
     print(f"  smallest correct-case margin: {min_margin:.3f}")
@@ -290,6 +388,43 @@ def main():
             f"REFUSING TO SAVE: held-out accuracy {heldout_acc:.3f} < 0.80. "
             "The model would fall back to keywords on real resumes."
         )
+
+    # The generated held-out set shares a generator with the training data, so
+    # a high score there can flatter the model. The hand-written probes and the
+    # REAL demo PDFs are the honest arbiters — gate on them explicitly.
+    curated_rows = rows[:len(HELDOUT_CURATED)]
+    if curated_rows:
+        curated_acc = sum(r[4] for r in curated_rows) / len(curated_rows)
+        print(f"  hand-written probe accuracy: {curated_acc:.3f} "
+              f"({len(curated_rows)} docs)")
+        if curated_acc < 1.0:
+            raise SystemExit(
+                f"REFUSING TO SAVE: hand-written probe accuracy "
+                f"{curated_acc:.3f} < 1.00 — the generated corpus is masking a "
+                "regression on realistic text."
+            )
+
+    # Accuracy alone is not enough: a model can pick the right label with a
+    # margin so thin that the SERVING rule rejects it and silently falls back
+    # to keywords — which is precisely how the original bug shipped green.
+    accept_rate, _ = _serving_acceptance(rows, 0.40, 0.10)
+    if accept_rate < 0.95:
+        raise SystemExit(
+            f"REFUSING TO SAVE: the serving rule would accept only "
+            f"{accept_rate:.1%} of held-out documents. The model is correct but "
+            "not confident enough to actually be used at inference time."
+        )
+
+    real_acc = _score_real_demo_resumes(pipeline)
+    if real_acc is not None:
+        print(f"  REAL demo PDF accuracy: {real_acc:.3f}")
+        if real_acc < 1.0:
+            raise SystemExit(
+                f"REFUSING TO SAVE: only {real_acc:.0%} of the real demo "
+                "resumes classify correctly. Synthetic gains that do not "
+                "transfer to real PDFs are exactly the bug this guard exists "
+                "to prevent."
+            )
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     joblib.dump({

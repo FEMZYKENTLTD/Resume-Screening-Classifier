@@ -897,3 +897,154 @@ def test_verify_password_tolerates_missing_hash():
     assert auth_mod.verify_password("x", "") is False
     assert auth_mod.verify_password("x", None) is False
     assert auth_mod.verify_password("", "") is False
+
+
+# ---------------- NER exercised WITHOUT the pretrained model ----------------
+
+HAS_SPACY_LIB = importlib.util.find_spec("spacy") is not None
+
+
+@pytest.mark.skipif(not HAS_SPACY_LIB, reason="spaCy library not installed")
+def test_ner_code_path_with_offline_spacy_pipeline(monkeypatch):
+    """`en_core_web_sm` ships only on GitHub's release-asset CDN, which many
+    CI networks block — so test_ner_extracts_person_and_orgs skips there and
+    the REAL NER code path (entity iteration, the skill-lexicon guard, the
+    'spacy-ner' method tag) went completely unexercised.
+
+    A blank spaCy pipeline + entity_ruler gives genuine spaCy Doc/Span objects
+    with no download, so the integration is verified everywhere.
+    """
+    import spacy
+
+    nlp = spacy.blank("en")
+    ruler = nlp.add_pipe("entity_ruler")
+    ruler.add_patterns([
+        {"label": "PERSON", "pattern": [{"LOWER": "tunde"}, {"LOWER": "bakare"}]},
+        {"label": "ORG", "pattern": [{"LOWER": "paystack"}]},
+        {"label": "ORG", "pattern": [{"LOWER": "kuda"}, {"LOWER": "bank"}]},
+        # The trap the skill-lexicon guard exists for:
+        {"label": "PERSON", "pattern": [{"LOWER": "docker"}]},
+    ])
+
+    monkeypatch.setattr(ner, "_NLP", nlp)
+    monkeypatch.setattr(ner, "_NLP_TRIED", True)
+    assert ner.ner_available() is True
+
+    text = ("Tunde Bakare\nSenior Data Engineer\n"
+            "Worked at Paystack and Kuda Bank building Airflow pipelines.")
+    assert ner.extract_name_ner(text) == "Tunde Bakare"
+    orgs = ner.extract_organizations(text)
+    assert "Paystack" in orgs and "Kuda Bank" in orgs
+
+    fields = extract_fields(text)
+    assert fields["extraction_method"] == "spacy-ner"
+    assert fields["name"] == "Tunde Bakare"
+    assert "Paystack" in fields["organizations"]
+
+
+@pytest.mark.skipif(not HAS_SPACY_LIB, reason="spaCy library not installed")
+def test_skill_lexicon_guard_rejects_tech_term_as_name(monkeypatch):
+    """Small NER models label tech terms as PERSON when the real name is
+    unfamiliar. 'Docker' must never be returned as a candidate's name."""
+    import spacy
+
+    nlp = spacy.blank("en")
+    ruler = nlp.add_pipe("entity_ruler")
+    ruler.add_patterns([{"label": "PERSON", "pattern": [{"LOWER": "docker"}]}])
+    monkeypatch.setattr(ner, "_NLP", nlp)
+    monkeypatch.setattr(ner, "_NLP_TRIED", True)
+
+    fields = extract_fields("Docker\nKubernetes and Terraform experience.\n")
+    assert fields["name"] != "Docker"
+
+
+def test_ner_unavailable_falls_back_to_regex(monkeypatch):
+    """The documented degradation path when the model is absent."""
+    monkeypatch.setattr(ner, "_NLP", None)
+    monkeypatch.setattr(ner, "_NLP_TRIED", True)
+    assert ner.ner_available() is False
+    assert ner.extract_name_ner("Jane Doe is here") is None
+    assert ner.extract_organizations("Worked at Google") == []
+
+    fields = extract_fields(RESUME_TEXT)
+    assert fields["extraction_method"] == "regex-heuristic"
+    assert fields["name"] == "Jane Doe"
+
+
+# ---------------- generated training corpus ----------------
+
+def test_corpus_generates_balanced_realistic_resumes():
+    from training.corpus import ROLES, make_dataset
+
+    rows = make_dataset(split="train", per_role=5)
+    assert len(rows) == len(ROLES) * 5
+    from collections import Counter
+    counts = Counter(label for _t, label in rows)
+    assert set(counts) == set(ROLES)
+    assert all(c == 5 for c in counts.values())
+
+    text = rows[0][0]
+    # Must carry the scaffolding that real CVs have and blurbs lacked.
+    for section in ("SUMMARY", "SKILLS", "EXPERIENCE", "EDUCATION"):
+        assert section in text
+    assert "@example.com" in text
+    assert "+234" in text
+
+
+def test_corpus_is_deterministic():
+    """Reproducible training runs — same seed, byte-identical corpus."""
+    from training.corpus import make_dataset
+    assert make_dataset(split="train", per_role=3) == \
+           make_dataset(split="train", per_role=3)
+
+
+def test_corpus_train_and_test_splits_are_disjoint():
+    """A held-out doc that duplicates a training doc makes the metric a lie."""
+    from training.corpus import make_dataset
+
+    train = {t for t, _ in make_dataset(split="train", per_role=20)}
+    test = {t for t, _ in make_dataset(split="test", per_role=10)}
+    assert not (train & test)
+
+    # Surface pools must differ too (names/employers/cities), otherwise the
+    # model can memorise entities rather than role vocabulary.
+    train_blob, test_blob = " ".join(train), " ".join(test)
+    assert "Paystack" in train_blob and "Paystack" not in test_blob
+    assert "Moniepoint" in test_blob and "Moniepoint" not in train_blob
+
+
+def test_admin_user_jobs_returns_columns_the_ui_renders(client):
+    """The Admin drill-down does pd.DataFrame(jobs)[[...cols...]]. If the API
+    stops returning one of those keys, pandas raises KeyError and the WHOLE
+    Admin page dies. Pin the contract from the server side."""
+    # ADMIN_USERNAMES defaults to "admin"; other tests may already own that
+    # account, so sign up if we can and fall back to logging in.
+    suffix = uuid.uuid4().hex[:8]
+    signup = client.post("/auth/signup", json={
+        "username": "admin", "email": f"admin{suffix}@e.co",
+        "password": "supersecret1"})
+    if signup.status_code == 201:
+        admin_tok = signup.json()["token"]
+    else:
+        admin_tok = client.post("/auth/login", json={
+            "username": "admin", "password": "supersecret1"}).json()["token"]
+
+    # give the admin a job so the drill-down table is non-empty
+    client.post("/single_analyze",
+                files={"resume": (f"adm{suffix}.pdf",
+                                  _sample_pdf(RESUME_TEXT + suffix),
+                                  "application/pdf")},
+                data={"jd": JD},
+                headers={"X-User-Token": admin_tok})
+
+    me = client.get("/auth/me", headers={"X-User-Token": admin_tok}).json()
+    r = client.get(f"/admin/users/{me['user_id']}/jobs",
+                   headers={"X-User-Token": admin_tok})
+    assert r.status_code == 200, r.text
+    jobs = r.json()["jobs"]
+    assert jobs, "expected at least one job for the drill-down"
+
+    required = {"filename", "jd_match_score", "predicted_role",
+                "status", "skills_extracted", "created_at"}
+    missing = required - set(jobs[0])
+    assert not missing, f"admin drill-down would KeyError on: {missing}"
