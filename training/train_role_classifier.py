@@ -11,7 +11,7 @@ Artifacts: models/role_classifier.joblib  (committed; auto-used by roles.py)
 The curated corpus is intentionally small and transparent so the labels are
 auditable — extend DATA with real (pseudonymized) resumes to improve it.
 
-IMPORTANT (v5.7): the original corpus was made of short, keyword-dense blurbs
+IMPORTANT: the original corpus was made of short, keyword-dense blurbs
 while real resumes carry a contact block, an education line and employer
 names. That train/serve mismatch diluted TF-IDF at inference time: the model
 still ranked the right label first, but its top probability sat around

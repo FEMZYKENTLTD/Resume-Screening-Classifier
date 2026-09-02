@@ -15,9 +15,10 @@ Prometheus/Grafana observability — all deployable with one command.
 ![Postgres](https://img.shields.io/badge/Database-PostgreSQL-336791?style=for-the-badge&logo=postgresql&logoColor=white)
 
 [![CI](https://github.com/FEMZYKENTLTD/Resume-Screening-Classifier/actions/workflows/deploy.yml/badge.svg)](https://github.com/FEMZYKENTLTD/Resume-Screening-Classifier/actions/workflows/deploy.yml)
-![Tests](https://img.shields.io/badge/Tests-65%20unit%20%2B%2021%20live%20E2E-brightgreen?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Tests-89%20unit%20%2B%2032%20live%20E2E-brightgreen?style=for-the-badge)
 ![Docker](https://img.shields.io/badge/Docker-Compose%20Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
+![Version](https://img.shields.io/badge/Version-v1.0-6366F1?style=for-the-badge)
 ![Status](https://img.shields.io/badge/Status-Production%20Ready-blueviolet?style=for-the-badge)
 ![UI](https://img.shields.io/badge/UI-%22Aurora%22%20Design%20System-D946EF?style=for-the-badge)
 
@@ -106,7 +107,7 @@ Streamlit UI  ──POST /single_analyze──▶  FastAPI  ──▶ parse → 
 |---|---|
 | 🔐 **Signup / Login** | bcrypt-hashed passwords, signed expiring tokens (`itsdangerous`) — no plaintext anywhere |
 | 🗂 **My History** | every analysis attributed to you (`resume_results.user_id`), filterable, exportable |
-| 🛠 **Admin dashboard** | user registry table, per-user drill-down, jobs/day, signups/day, profession & tech-stack distributions, score histogram — gated by `ADMIN_USERNAMES` (anon **401**, non-admin **403**, machine-verified) |
+| 🛠 **Admin dashboard** | user registry table, per-user drill-down, jobs/day, signups/day, profession & tech-stack distributions, score histogram — role-gated (anon **401**, non-admin **403**, machine-verified). Roles come from `users.is_admin`, granted by `ADMIN_USERNAMES`/`ADMIN_EMAILS`, owner bootstrap, the **Roles & Access** panel or `scripts/grant_admin.py` |
 
 ### 🏗 Platform & Ops
 | Feature | Detail |
@@ -116,7 +117,7 @@ Streamlit UI  ──POST /single_analyze──▶  FastAPI  ──▶ parse → 
 | 📈 **Observability** | `/metrics` on API **and** worker; Grafana dashboard provisioned out-of-the-box |
 | ✅ **CI/CD** | compile-check → test suite → migration-check → deploy (Fly.io API+worker, Render UI) |
 
-### 💜 UI/UX — "Aurora" *(new in v5.5)*
+### 💜 UI/UX — "Aurora"
 - 🌈 **Animated aurora background** — four drifting, blurred gradient orbs (indigo / fuchsia / cyan / blue)
 - 🪟 **Glassmorphism cards** with backdrop blur, soft shadows and hover-lift physics
 - 🔢 **Count-up KPI tiles** with staggered entrance choreography
@@ -205,7 +206,9 @@ Resume-Screening-Classifier/
 ├── 📄 pytest.ini               # test discovery + strict markers
 ├── 📄 .dockerignore            # keeps .git/.venv/wheels out of build context
 ├── 📄 scoring.py               # match score (0–100) + gap analysis
-├── 📁 training/
+├── 📁 training/                # auditable corpus + trainer
+│   ├── 📄 corpus.py            # seeded generator: 619 resume-shaped documents
+│   ├── 📄 train_role_classifier.py # trains + REFUSES to ship a bad model
 │   ├── 📄 pseudonymize.py      # strip PII from REAL resumes (fail-closed audit)
 │   └── 📄 ingest_real_resumes.py # folder of real CVs -> safe training corpus
 ├── 📄 matching_engine.py       # optional semantic matching (sentence-transformers)
@@ -213,25 +216,25 @@ Resume-Screening-Classifier/
 ├── 📄 models.py                # SQLAlchemy models
 ├── 📄 database.py              # env-driven engine/session
 │
-├── 📁 migrations/              # Alembic — single linear head (7 revisions)
+├── 📁 migrations/              # Alembic — single linear head (8 revisions)
 ├── 📁 models/
 │   └── role_classifier.joblib  # trained artifact (committed, ~170 KB)
-├── 📁 training/                # auditable training corpus + train_role_classifier.py
 ├── 📁 tests/
-│   └── test_core.py            # 31 end-to-end tests (SQLite + eager Celery)
+│   └── test_core.py            # 89 end-to-end tests (SQLite + eager Celery)
 ├── 📁 scripts/
-│   └── verify_ui_live.py       # 21-check live E2E (AppTest + HTTP round-trips)
+│   ├── verify_ui_live.py       # 32-check live E2E (AppTest + HTTP round-trips)
+│   └── grant_admin.py          # break-glass: grant/revoke admin, force-logout
 ├── 📁 demo/resumes/            # 🎬 demo kit: 4 sample resumes (+ job_description.txt)
 ├── 📁 .streamlit/
 │   └── config.toml             # server + Aurora theme
 ├── 📁 monitoring/              # prometheus.yml + Grafana provisioning & dashboards
-├── 📁 docs/images/             # architecture diagram
+├── 📁 docs/                    # architecture diagram + engineering audit report
 │
 ├── 🐳 Dockerfile.api / .worker / .worker.ml / .streamlit
 ├── 🐳 docker-compose.yml       # db · redis · api · worker · streamlit · prometheus · grafana
 ├── ☁️ fly.api.toml / fly.worker.toml / render.yaml
 ├── ⚙️ .github/workflows/deploy.yml
-└── 📄 alembic.ini · requirements.txt · .env.example · wait-for-db.sh
+└── 📄 VERSION · alembic.ini · requirements.txt · .env.example · wait-for-db.sh
 ```
 
 ---
@@ -263,8 +266,20 @@ Then open:
 | 📊 Grafana (admin/admin) | http://localhost:3000 |
 | 📈 Prometheus | http://localhost:9090 |
 
-Migrations run automatically on API start. Sign up on the UI, or make yourself admin by
-adding your username to `ADMIN_USERNAMES`.
+Migrations run automatically on API start.
+
+**Becoming admin** — any one of these works:
+1. **Sign up first.** The very first account on a fresh instance is the owner and is made
+   admin automatically (`ADMIN_BOOTSTRAP_FIRST_USER=1`).
+2. **Name it in the config:** `ADMIN_USERNAMES=admin,femzyk` (or `ADMIN_EMAILS=…`), then log in.
+3. **Ask an existing admin** to flip it in **🛠 Admin → 🛡 Roles & Access** (takes effect for
+   that user within 30 s, no re-login needed).
+4. **Break glass, no admin left:**
+   ```bash
+   DATABASE_URL="postgresql://…" python scripts/grant_admin.py --list
+   DATABASE_URL="postgresql://…" python scripts/grant_admin.py --username femzyk
+   ```
+   Admin granted in the database is **never** silently removed by logging in.
 
 ### 🐍 Option B — Local dev (hot reload)
 
@@ -296,7 +311,14 @@ API_URL=http://localhost:8000 streamlit run app.py
 | `API_URL` | `http://localhost:8000` | where the UI finds the API |
 | `AUTH_SECRET_KEY` | **change me!** | token-signing secret (long random string in prod) |
 | `TOKEN_MAX_AGE_DAYS` | `7` | session token lifetime |
-| `ADMIN_USERNAMES` | `admin` | comma-separated admin usernames |
+| `ADMIN_USERNAMES` | `admin` | comma-separated usernames that are **granted** admin at signup/login |
+| `ADMIN_EMAILS` | — | same, matched on email |
+| `ADMIN_BOOTSTRAP_FIRST_USER` | `1` | if the instance has **no** admin, promote the oldest (owner) account |
+| `ADMIN_STRICT_SYNC` | `0` | `1` = mirror the lists exactly, demoting anyone not listed (off by default: it used to wipe DB-granted admins) |
+| `ALLOW_LEGACY_LOGIN` | `1` | `0` = never fall back to the env-credential login when the API is down |
+| `API_HEALTH_TIMEOUT` / `API_HEALTH_RETRIES` | `8` / `3` | how patient the UI is with a cold API before declaring it offline |
+| `API_ANALYZE_TIMEOUT` | `120` | UI timeout for `/single_analyze` |
+| `CORS_ALLOW_ORIGINS` | `*` | lock the API down to your UI origin in production |
 | `ENABLE_SEMANTIC` | `0` | `1` = blend embedding score (needs sentence-transformers) |
 | `HR_PASSWORD` / `RECRUITER_PASSWORD` / `COOKIE_KEY` | — | **legacy** offline login only (API down) |
 
@@ -339,7 +361,9 @@ tech-stack mix, score histogram — plus a **401/403 security gate** (machine-ve
 |---|---|---|---|
 | `GET` | `/health` | — | liveness probe |
 | `POST` | `/auth/signup` | — | create account → `{ token }` |
-| `POST` | `/auth/login` | — | `{ username, password }` → `{ token, is_admin }` |
+| `POST` | `/auth/login` | — | `{ username, password }` → `{ token, is_admin }` (grant-only admin sync) |
+| `GET` | `/auth/me` | 🔒 | validate a token → current `{ username, email, is_admin }` |
+| `POST` | `/auth/logout` | 🔒 | revoke **every** token for the caller (`token_version++`) — idempotent |
 | `POST` | `/single_analyze` | optional | multipart resume + JD → `200` completed result (dedup-aware) |
 | `GET` | `/results/{job_id}` | — | job status → score, role, fields, skills |
 | `GET` | `/history` | 🔒 | caller's analyses |
@@ -347,6 +371,7 @@ tech-stack mix, score histogram — plus a **401/403 security gate** (machine-ve
 | `GET` | `/admin/overview` | 👑 | users/jobs/status totals |
 | `GET` | `/admin/users` | 👑 | user registry w/ job stats |
 | `GET` | `/admin/users/{id}/jobs` | 👑 | per-user drill-down |
+| `POST` | `/admin/users/{id}/admin` | 👑 | `{ is_admin }` → grant/revoke admin (last admin protected) |
 | `GET` | `/admin/trends?days=N` | 👑 | activity & distribution trends |
 | `GET` | `/metrics` | — | Prometheus exposition (API + worker) |
 
@@ -441,15 +466,17 @@ scrubber and auditor share one `_is_phone()` rule so they cannot disagree.
 Everything claimed above is **machine-verified**, not vibes:
 
 ```bash
-pytest tests/ -q                     # 81 tests — full stack on SQLite + eager Celery
-                                     #   • with spaCy + scikit-learn:   80 passed, 1 model-only skip
-                                     #   • bare CI (no ML extras):      72 passed, 9 auto-skips
+pytest tests/ -q                     # 89 tests — full stack on SQLite + eager Celery
+                                     #   • scikit-learn + spaCy + psycopg2: 88 passed,
+                                     #     1 skip (pretrained spaCy weights unavailable offline)
+                                     #   • bare CI (no optional extras):    79 passed, 10 auto-skips
 python -m training.train_role_classifier   # retrain + REFUSE to ship a bad model
-python scripts/verify_ui_live.py     # 21 passed — drives the REAL running stack:
+python scripts/verify_ui_live.py     # 32 passed — drives the REAL running stack:
                                      # HTTP login → PDF through the pipeline → AppTest on every page
+                                     # → logout revocation → admin-role stability
 ```
 
-**Resilience suite** (added in v5.7, covering the production `/single_analyze` 500):
+**Resilience suite** (covering the production `/single_analyze` 500):
 
 | Test | Guards against |
 |---|---|
@@ -463,7 +490,7 @@ python scripts/verify_ui_live.py     # 21 passed — drives the REAL running sta
 | `test_safe_json_tolerates_corrupt_rows` | one bad JSON column 500-ing history/results |
 | `test_alembic_migrations_have_single_head` | a split head breaking `alembic upgrade head` on deploy |
 
-**Model & correctness suite** (v5.7):
+**Model & correctness suite:**
 
 | Test | Guards against |
 |---|---|
@@ -489,7 +516,46 @@ CI runs the same gates on every push: **compile → migrate-check → test suite
 
 ## 🛠 Troubleshooting
 
-### `500 Server Error ... /single_analyze` (fixed in v5.7)
+### 🚪 "Log out doesn't work / I'm stuck on the login page" (fixed in v1.0)
+
+Three separate defects stacked up:
+
+| # | Root cause | Fix |
+|---|---|---|
+| 1 | Session tokens were **stateless and un-revocable**. Logging out only tried to delete a browser cookie | `POST /auth/logout` bumps `users.token_version`; every token minted earlier dies instantly (server-side, all devices) |
+| 2 | The cookie-clearing `<script>` was rendered and then `st.rerun()` **ripped the iframe out of the DOM before it executed**, so the cookie survived | the deletion is now rendered on the login page that stays on screen, and it writes through `window.parent.document.cookie` |
+| 3 | `st.context.cookies` reflects the cookie header of the **original page load** — after logout it still contained the old token, so the "restore my session" block signed the user straight back in | a `logged_out` session flag suppresses cookie restore for the rest of that browser session |
+
+The "stuck on the login page" half had a fourth cause: a single slow `/health` probe
+(3 s timeout, no retry) against a cold backend flipped the whole UI into the **legacy
+env-credential login**, which real database accounts can never pass. The probe is now
+cached (30 s), retried 3×, and **sticky** — once the API has answered in a browser
+session the UI shows a "reconnecting" banner instead of demoting you to the offline form
+(`ALLOW_LEGACY_LOGIN=0` disables that fallback entirely).
+
+### 👑 "My admin account doesn't show as admin" (fixed in v1.0)
+
+`/auth/login` used to *mirror* `ADMIN_USERNAMES` onto the account:
+
+```python
+should_be = _is_admin_name(user.username)
+if bool(user.is_admin) != should_be:
+    user.is_admin = should_be      # ← demoted every DB-granted admin, silently
+```
+
+So flipping `is_admin` in Supabase worked exactly until the next login, which set it
+back to `false`. Reproduced, then fixed:
+
+- the env lists are now **grant-only** (opt back in with `ADMIN_STRICT_SYNC=1`);
+- **owner bootstrap**: if the instance has no admin at all, the oldest account is
+  promoted on login (a late signup can never grab it);
+- `POST /admin/users/{id}/admin` + the **🛡 Roles & Access** panel let an admin promote
+  or demote anyone, with the last admin protected;
+- the UI re-reads `/auth/me` every 30 s, so a promotion appears **without re-login**
+  (and a revoked session is dropped immediately);
+- `scripts/grant_admin.py` is the break-glass CLI when nobody can get in.
+
+### `500 Server Error ... /single_analyze` (fixed in v1.0)
 
 The live UI used to surface a raw traceback:
 
@@ -622,113 +688,112 @@ docker build --build-arg SPACY_MODEL_REQUIRED=1 -f Dockerfile.api .
 
 ---
 
-## 🆕 What's new in v5.8 — the classifier gets a real corpus
+## 🆕 Release notes — v1.0
+
+**v1.0 is the first stable release.** Everything below shipped into it; the list is grouped
+by area rather than by interim version so there is exactly one version number in this repo.
+
+### 🔐 Sessions, accounts & roles
+
+- 🚪 **Logout that actually logs out.** `POST /auth/logout` revokes every outstanding token
+  by bumping `users.token_version`, so a stale browser cookie can no longer resurrect a
+  session. The UI revokes server-side **first**, then expires the cookie on a page that
+  stays on screen long enough for the browser to run the script, and a `logged_out` flag
+  stops the restore path replaying the old cookie header
+- 🔁 **No more "stuck on the login page."** The `/health` probe is retried, cached (30 s)
+  and sticky, so a cold backend can no longer dump you into the legacy offline login that
+  database accounts cannot pass (`ALLOW_LEGACY_LOGIN=0` removes that form entirely).
+  Offline mode also finally has its own working **Log out** button
+- 👑 **Admin rights that stick.** The `ADMIN_USERNAMES` / `ADMIN_EMAILS` allow-lists are
+  **grant-only** — login no longer mirrors them onto the row and demotes admins granted in
+  the database (`ADMIN_STRICT_SYNC=1` restores the old behaviour). Owner bootstrap promotes
+  the oldest account when an instance has no admin at all
+- 🛡 **Roles & Access panel** + `POST /admin/users/{id}/admin` — promote/demote from the
+  Admin dashboard, last admin protected, live for the target user in ≤30 s (the UI
+  re-reads `/auth/me`, so no re-login is needed)
+- 🧰 **`scripts/grant_admin.py`** — break-glass CLI: list users, grant/revoke admin,
+  force-logout, straight against `DATABASE_URL`
+- 🔐 **bcrypt + signed expiring tokens**; `/auth/signup` survives long/accented passwords
+  (bcrypt 5.x raises above 72 **bytes** — truncation is UTF-8-safe and applied identically
+  on hash and verify), and a signup race returns **409**, not 500
+
+### 🧠 Model & data quality
 
 - 📚 **619-document training corpus** (`training/corpus.py`) — a seeded, reproducible
-  generator that emits **resume-shaped** documents: name, contact line, title, summary,
-  dated employment history with employers, skills line, degree, and soft-skill filler.
-  That scaffolding is the realistic noise the old 56 keyword blurbs completely lacked
-- 🎯 **Confidence roughly doubled on the real demo PDFs** — 0.43→0.55, 0.52→0.75,
-  0.39→0.61, 0.42→0.73, all four still correct and all served by the ML model
-- 🧩 **6/6 on deliberately ambiguous overlap cases** — including the Data-Engineering
-  resume loaded with Docker/Kubernetes/CI/CD that originally misfired as *DevOps*
-- 🚧 **Train/test splits are provably disjoint** — different seeds *and* disjoint pools
-  of names, employers and cities, so a held-out doc can never echo a training doc
-- 🛑 **The training script refuses to ship a bad model.** It hard-fails if held-out
-  accuracy < 0.80, if the hand-written probes regress, if the **real demo PDFs** are not
-  100% correct, or if the **serving rule would accept < 95%** of held-out docs. That last
-  gate is the one that would have caught the original bug, where the model was accurate
-  but too flat to ever be used
-- 📈 **Per-class reporting** — accuracy, mean confidence and mean margin for all 9 roles,
-  so one broken class can't hide behind a good average
-- 🕵️ **NER guard hole closed** — the skill-lexicon check rejected "Docker" as a name in
-  the spaCy path, but the **regex fallback happily re-introduced it**. Both paths guarded
-- 🧨 **Admin page crash fixed** — `/admin/users/{id}/jobs` never returned
-  `skills_extracted`, yet the drill-down hard-indexed that column, so the whole Admin
-  page died with a pandas `KeyError` for any admin who had run a job. API now returns it
-  and the UI selects columns defensively
-- 🌐 **spaCy model install no longer risks the build** — see
-  [Troubleshooting](#en_core_web_sm-fails-to-install-blocked-github-cdn)
+  generator emitting **resume-shaped** documents (name, contact line, title, summary, dated
+  employment history, skills line, degree, filler) instead of short keyword blurbs
+- 🎯 **The trained classifier actually runs.** The old train/serve mismatch kept the top
+  probability under the confidence gate, so **every real upload silently fell back** to
+  keyword profiles. Fixed with resume-shaped data plus a **margin-based** accept rule:
+  real demo PDFs went from 2/4 correct (0 via ML) → **4/4, all via ML**
+- 🧩 **6/6 on deliberately ambiguous overlap cases**, including the Data-Engineering resume
+  loaded with Docker/Kubernetes/CI-CD that used to misfire as *DevOps*
+- 🚧 **Provably disjoint train/test splits** (different seeds *and* disjoint name, employer
+  and city pools) — held-out accuracy **100% over 141 unseen documents**
+- 🛑 **The training script refuses to ship a bad model** — it hard-fails below 0.80 held-out
+  accuracy, on probe regressions, if the real demo PDFs are not 100% correct, or if the
+  **serving rule** would accept < 95% of held-out docs (the gate that would have caught the
+  original "accurate but too flat to ever fire" bug). Per-class accuracy/confidence/margin
+  is reported for all 9 roles
+- 🆕 **`Data Analytics / BI` role family** — analyst CVs previously had no valid label and
+  landed in *General / Uncategorized*
+- 🕵️ **NER guard hole closed** — the skill-lexicon check rejected "Docker" as a name in the
+  spaCy path while the regex fallback happily re-introduced it. Both paths are guarded now
+- 🔤 **`C++`, `node.js` and `ci/cd` are detectable again** (`\bc\+\+\b` can never match: `+`
+  is a non-word char, so the trailing `\b` demands a word char after it), and skill names
+  are no longer mangled into "Node.Js" / "Ci/Cd" / "Rest Api" in the UI, CSV and PDF
 
----
+### 🎯 Scoring
 
-## 🆕 What's new in v5.7 — reliability hardening
+- Stopwords excluded from **both** sides, log-damped term frequency, 2× weight for known
+  tech skills, and `matched_skills` / `missing_skills` returned so the UI can show the gap.
+  A boilerplate-only resume dropped from 14% → **0%**, a real matching CV rose 41% → **80%**
+- Tokenizer fix: trailing punctuation is stripped (`bigquery.` == `bigquery`) while `c++`,
+  `c#`, `ci/cd` and `node.js` survive intact
 
-- 🩹 **Fixed the live `500` on `POST /single_analyze`** — parsed text is now scrubbed of
-  NUL bytes, control characters and lone surrogates before it can reach PostgreSQL
-  (see [🛠 Troubleshooting](#-troubleshooting) for the full root-cause writeup)
-- 🛡 **Optional ML extras genuinely degrade now** — a corrupt `role_classifier.joblib`
-  or an OOM-killed spaCy load records an error in `match_details` and still returns a
-  completed analysis instead of a 500
-- 🧯 **The UI can no longer crash on an API error** — `analyze_via_api()` returns
-  `(payload, error)` and never raises; failed uploads fall back to the local score
-- 📛 **Correct HTTP semantics** — `400` empty file/JD, `409` dedup race, `503` database
-  down, `500` only for genuine internal faults (and bodies no longer leak internals)
-- 📄 **PDF line structure preserved** — pages are newline-joined, so candidate-name
-  extraction works on PDF resumes again (it previously collapsed the CV onto one line)
-- 🔐 **`streamlit-authenticator` 0.3.x *and* 0.4.x supported** in the offline-login path
-- 🧪 **+13 regression tests** (44 unit total) incl. a psycopg2-adapter proof and an
-  Alembic single-head guard
-- 🪵 **Structured server-side logging** with full tracebacks; `DEBUG_ERRORS=1` to echo
-  details, `API_ANALYZE_TIMEOUT` to tune UI patience for cold machines
+### 🧯 Reliability
 
-**Model & data-quality fixes (second audit pass):**
+- 🩹 **The live `500` on `POST /single_analyze` is gone** — parsed text is scrubbed of NUL
+  bytes, control characters and lone surrogates before it can reach PostgreSQL
+- 🛡 **Optional ML extras degrade for real** — a corrupt `role_classifier.joblib` or an
+  OOM-killed spaCy load records the error in `match_details` and still returns a completed
+  analysis instead of a 500
+- 🧯 **The UI cannot crash on an API error** — `analyze_via_api()` returns `(payload, error)`
+  and never raises; failed uploads fall back to the local score
+- 📛 **Correct HTTP semantics** — `400` empty file/JD, `409` dedup race, `503` database down,
+  `500` only for genuine internal faults, and error bodies no longer leak internals
+- 📄 **PDF line structure preserved** (pages newline-joined), so name extraction works again
+- 🧨 **Admin page crash fixed** — `/admin/users/{id}/jobs` now returns `skills_extracted`,
+  which the drill-down hard-indexed, and the UI selects columns defensively
+- 🪵 **Structured logging** with full tracebacks; `DEBUG_ERRORS=1` echoes details and
+  `API_ANALYZE_TIMEOUT` tunes UI patience for cold machines
 
-- 🧠 **The trained classifier now actually runs.** The corpus was short keyword
-  blurbs while real CVs carry contact/education/employer noise — that train/serve
-  mismatch kept the top probability near 0.26–0.30, under the old `MIN_CONFIDENCE=0.45`
-  gate, so **every real upload silently fell back to keyword profiles** (which also
-  mislabelled the data engineer as *DevOps*). Fixed with resume-shaped training data,
-  a **margin-based** accept rule, and a held-out set that the training run enforces.
-  Real demo PDFs went from **2/4 correct (0 via ML)** → **4/4 correct, all via ML**
-- 📊 **Honest metrics.** `cv_macro_f1: 1.0` was measured on synthetic blurbs and did not
-  transfer. The artifact now also records `heldout_accuracy` on never-trained-on,
-  resume-shaped probes, and `train_role_classifier.py` **refuses to save** below 0.80
-- 🆕 **New role family: `Data Analytics / BI`** — analyst CVs previously had no valid
-  label anywhere and landed in *General / Uncategorized*
-- 🔤 **`C++` was undetectable.** `\bc\+\+\b` can never match ('+' is a non-word char,
-  so the trailing `\b` demands a word char after it). Same trap fixed for `node.js`
-  and `ci/cd`
-- 🏷 **Skill names no longer mangled** — `str.title()` produced "Node.Js", "Ci/Cd",
-  "Rest Api", "Aws" in the UI, CSV export and PDF report; canonical casing now
-- 🔐 **`/auth/signup` no longer 500s on long passwords** — the schema allows 128 chars
-  but bcrypt 5.x *raises* above 72 **bytes** (accented passwords hit this fast).
-  Truncation is UTF-8-safe and applied identically on hash and verify
-- 🧯 **Signup race returns 409, not 500** — concurrent duplicate registrations collide
-  on the unique index; verified with 5 parallel signups (`201 409 409 409 409`)
+### 📊 Dashboards, API & CI
 
----
+- **Prometheus middleware** rebuilt (per-route counters + latency, bounded label
+  cardinality); `/metrics` on API **and** worker, with a provisioned Grafana board
+- **API contract restored and extended** — `score_histogram` on `/analytics/summary` and
+  `/admin/trends`; `by_status`, `jobs_last_7d`, `avg_match_score` on `/admin/overview`;
+  per-user `completed` / `failed` / `last_active` on `/admin/users` (single-scan
+  aggregation, N+1 removed); plus `/auth/me`, `/auth/logout`, `/admin/users/{id}/admin`
+- **Signup policy** — username ≥ 3, password ≥ 8, `422` on violation; login stays lenient
+  so a wrong password is a `401`, not a validation error
+- **GitHub Actions on Node 24** — `actions/checkout@v7`, `actions/setup-python@v7` and the
+  flyctl action pinned to `@v1` (Node 20 leaves the runners on 2026-09-16). The stale
+  `docs/deploy.yml.node24` duplicate is gone; the one remaining CI nicety — installing the
+  pinned `requirements-dev.txt` — is documented in that file (workflow edits need a token
+  with `workflows` permission)
 
-## 🆕 What's new in v5.6
+### 💜 UI & packaging
 
-- 🔧 **CI repair** — the `verify` workflow had rotted: `api_server.py` imported
-  `auth.BaseModel` (pydantic lives in `api_server`, not `auth`), called three
-  `monitoring` helpers that no longer existed (`init_metrics`, `generate_metrics`,
-  `record_request`), and signup validation was missing entirely. All fixed; the
-  **Prometheus middleware** (per-route request counters + latency) was rebuilt to match.
-- 📊 **Dashboard API contract restored** — `/analytics/summary` and `/admin/trends`
-  expose `score_histogram` again; `/admin/overview` returns `by_status`,
-  `jobs_last_7d`, `avg_match_score`; `/admin/users` now includes per-user
-  `completed` / `failed` / `last_active` (single-scan aggregation, N+1 removed).
-  The Analytics + Admin pages render exception-free again — **live E2E 21/21**.
-- 🛡 **Signup policy** — username ≥ 3 chars, password ≥ 8 chars, 422 on violation;
-  login stays lenient so wrong-password attempts still surface as 401.
-- ⬆️ **GitHub Actions modernized** — `actions/checkout@v7`, `actions/setup-python@v7`
-  (Node 24 runtime; Node 20 leaves the runners on 2026-09-16), flyctl action pinned
-  to `@v1` instead of a floating `@master`.
-- 📜 README updated to match reality (synchronous API contract, honest test counts).
-
-## 🆕 What's new in v5.5
-
-- 💜 **"Aurora" UI redesign** — glassmorphism, animated gradient background, count-up KPIs,
-  animated score ring, deep-space sidebar, staggered entrance choreography (replaces the old
-  neon theme). Theme ships as config (`.streamlit/config.toml` + `streamlit_app.toml`)
-- 🎬 **Demo kit** — 4 realistic sample resumes + ready-made JD in `demo/` for instant try-outs
-- 🐛 **PDF export crash fixed** (fpdf2 `bytearray` API change) — caught by live AppTest
-- 🧠 **NER name hardening** — skill-lexicon guard + first-line span trim ("Docker" is a tool, not a person)
-- 🧪 **21-check live E2E harness** (`scripts/verify_ui_live.py`)
-- 📜 **LICENSE + hardened `.gitignore`** (secrets, runtime artifacts, 290 MB wheel mirrors)
-- 🧹 2026 deprecation sweep (`use_container_width` → `width="stretch"`, fpdf2 modern API)
+- **"Aurora" design system** — glassmorphism, animated gradient background, count-up KPIs,
+  animated score ring, deep-space sidebar, staggered entrance choreography; theme ships as
+  config (`.streamlit/config.toml` + `streamlit_app.toml`)
+- **Demo kit** — 4 realistic sample resumes + a ready-made JD in `demo/`
+- **PDF export crash fixed** (fpdf2 `bytearray` API change), 2026 deprecation sweep
+  (`use_container_width` → `width="stretch"`), `streamlit-authenticator` 0.3.x *and* 0.4.x
+  supported in the offline path
+- **MIT LICENSE + hardened `.gitignore`** (secrets, runtime artifacts, 290 MB wheel mirrors)
 
 ---
 
@@ -769,7 +834,6 @@ Distributed under the **MIT License** — see [`LICENSE`](LICENSE).
 - 💼 Aspiring ML / Full-Stack Engineer
 - 🌍 Lagos, Nigeria 🇳🇬 (Alimosho LGA)
 - 📧 femzykenterprisesltd@gmail.com
-- 🔗 [LinkedIn](Working%20on%20retrieval)
 - 🐙 [GitHub](https://github.com/FEMZYKENTLTD)
 
 ---

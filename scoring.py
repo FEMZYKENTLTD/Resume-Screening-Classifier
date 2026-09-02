@@ -2,7 +2,7 @@
 Shared scoring logic — single source of truth used by the API, the Celery
 worker and the Streamlit dashboard (so they can never disagree again).
 
-WHY THIS WAS REWRITTEN (v5.9)
+WHY THIS WAS REWRITTEN
 -----------------------------
 The original implementation was:
 

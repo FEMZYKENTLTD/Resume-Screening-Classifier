@@ -48,6 +48,13 @@ st.set_page_config(
 API_URL = os.environ.get("API_URL", "http://localhost:8000").rstrip("/")
 # Cold Fly.io machines + spaCy/sklearn imports can take a while on first hit.
 API_ANALYZE_TIMEOUT = int(os.environ.get("API_ANALYZE_TIMEOUT", "120"))
+# Health probe: a cold backend can take a few seconds to answer. These control
+# how patient the UI is before it decides the API is down (see api_available).
+API_HEALTH_TIMEOUT = float(os.environ.get("API_HEALTH_TIMEOUT", "8"))
+API_HEALTH_RETRIES = int(os.environ.get("API_HEALTH_RETRIES", "3"))
+# Allow the legacy env-credential login when the API is unreachable. Set to 0
+# on a deployment whose accounts all live in the API/database.
+ALLOW_LEGACY_LOGIN = os.environ.get("ALLOW_LEGACY_LOGIN", "1").lower() in ("1", "true", "yes")
 
 
 def _api_error_detail(resp) -> str:
@@ -561,21 +568,54 @@ def _chart_style(chart: alt.Chart) -> alt.Chart:
 
 
 # ---------------- ACCOUNT LAYER ----------------
-def api_available() -> bool:
+def _ping_api() -> bool:
+    """One health probe, tolerant of a cold backend."""
     try:
-        return requests.get(f"{API_URL}/health", timeout=3).ok
+        return requests.get(f"{API_URL}/health", timeout=API_HEALTH_TIMEOUT).ok
     except requests.RequestException:
         return False
 
 
-USING_API = api_available()
+@st.cache_data(ttl=30, show_spinner=False)
+def _api_available_cached(_bucket: int) -> bool:
+    """Health probe, cached for 30s and retried before giving up.
+
+    Why this matters: the result decides between API accounts and the LEGACY
+    env-credential login. A single slow probe against a cold Fly.io machine
+    used to flip the whole app into legacy mode mid-session — the user then
+    faced a login form their real account could not open ("stuck on the login
+    page"). Retry, cache, and (below) stay sticky once the API has answered.
+    """
+    for attempt in range(API_HEALTH_RETRIES):
+        if _ping_api():
+            return True
+        if attempt + 1 < API_HEALTH_RETRIES:
+            time.sleep(0.4)
+    return False
+
+
+def api_available() -> bool:
+    return _api_available_cached(int(time.time() // 30))
+
 
 inject_css()
 
 for key, default in (("token", None), ("username", None), ("is_admin", False),
-                     ("screen", None), ("_flash", None)):
+                     ("screen", None), ("_flash", None),
+                     ("api_seen_up", False), ("logged_out", False),
+                     ("_admin_checked_at", 0.0)):
     if key not in st.session_state:
         st.session_state[key] = default
+
+USING_API = api_available()
+if USING_API:
+    st.session_state.api_seen_up = True
+elif st.session_state.api_seen_up or st.session_state.token:
+    # The backend answered earlier in this browser session (or we still hold a
+    # token): treat a blip as a transient outage instead of silently demoting
+    # the user into the legacy offline login they cannot authenticate against.
+    USING_API = True
+    st.session_state._api_degraded = True
 
 
 def api_headers() -> dict:
@@ -602,20 +642,54 @@ def _read_session_cookie() -> str | None:
 
 
 def _write_session_cookie(token: str | None) -> None:
-    """Set (or, with None, expire) the session cookie. Streamlit has no
-    native cookie-write API, so a zero-height same-origin iframe asks the
-    browser directly. SameSite=Lax; scoped to this app only."""
+    """Set (or, with None, expire) the session cookie.
+
+    Streamlit has no cookie-write API, so a zero-height component iframe asks
+    the browser. Two hard-won details:
+
+    * the write targets ``window.parent.document`` first — the component
+      iframe is same-origin, and writing on the parent document is what makes
+      the deletion visible to the next page load;
+    * the caller must NOT ``st.rerun()`` straight after. A rerun tears the
+      iframe out of the DOM before its script runs, which is exactly why
+      "Log out" used to leave the cookie in place and the app logged the user
+      straight back in. The logout path below renders this on a page that
+      stays on screen.
+    """
     if token:
         pair = f"{SESSION_COOKIE}={token}; max-age={7 * 24 * 3600}; path=/; SameSite=Lax"
     else:
-        pair = f"{SESSION_COOKIE}=; max-age=0; path=/; SameSite=Lax"
+        # Expire it, and belt-and-braces clear any host-only duplicate.
+        pair = f"{SESSION_COOKIE}=; max-age=0; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/; SameSite=Lax"
     try:
         components.html(
-            "<script>document.cookie = " + json.dumps(pair) + ";</script>",
+            "<script>(function(){var c=" + json.dumps(pair) + ";"
+            "try{window.parent.document.cookie=c;}catch(e){}"
+            "try{document.cookie=c;}catch(e){}})();</script>",
             height=0,
         )
     except Exception:
         pass  # cookie persistence is a nicety, never a crash
+
+
+def _adopt_session(data: dict) -> None:
+    """Install a freshly issued session (login or signup)."""
+    st.session_state.token = data["token"]
+    st.session_state.username = data["username"]
+    st.session_state.is_admin = bool(data.get("is_admin"))
+    st.session_state.logged_out = False      # re-enable cookie persistence
+    st.session_state._admin_checked_at = time.time()
+
+
+def _drop_session(message: str = "Session expired — please log in again.") -> None:
+    """Forget the session locally and stop the cookie from restoring it."""
+    st.session_state.token = None
+    st.session_state.username = None
+    st.session_state.is_admin = False
+    st.session_state.logged_out = True
+    st.session_state._admin_checked_at = 0.0
+    _flash(message, "🔒")
+
 
 def _do_login(username: str, password: str) -> str | None:
     try:
@@ -627,11 +701,12 @@ def _do_login(username: str, password: str) -> str | None:
         return "API unreachable"
     if resp.ok:
         data = resp.json()
-        st.session_state.token = data["token"]
-        st.session_state.username = data["username"]
-        st.session_state.is_admin = bool(data.get("is_admin"))
+        _adopt_session(data)
         return None
-    return resp.json().get("detail", "Login failed")
+    try:
+        return resp.json().get("detail", "Login failed")
+    except ValueError:
+        return f"Login failed ({resp.status_code})"
 
 
 def _do_signup(username: str, email: str, password: str) -> str | None:
@@ -645,9 +720,7 @@ def _do_signup(username: str, email: str, password: str) -> str | None:
         return "API unreachable"
     if resp.ok:
         data = resp.json()
-        st.session_state.token = data["token"]
-        st.session_state.username = data["username"]
-        st.session_state.is_admin = bool(data.get("is_admin"))
+        _adopt_session(data)
         return None
     try:
         return resp.json().get("detail", str(resp.json()))
@@ -655,13 +728,19 @@ def _do_signup(username: str, email: str, password: str) -> str | None:
         return f"Signup failed ({resp.status_code})"
 
 # ---------------- REFRESH: restore session from cookie ----------------
-if USING_API and not st.session_state.token:
+# `st.context.cookies` reflects the cookies the BROWSER sent with the page
+# load — it does not update on a rerun. After a logout in the same page view
+# it therefore still contains the old token, which is why the app used to
+# resurrect the session immediately. `logged_out` suppresses the restore for
+# the rest of this browser session; the cookie itself is expired below and
+# the token was revoked server-side by /auth/logout.
+if USING_API and not st.session_state.token and not st.session_state.logged_out:
     remembered = _read_session_cookie()
     if remembered:
         try:
             me = requests.get(
                 f"{API_URL}/auth/me",
-                headers={"X-User-Token": remembered}, timeout=5,
+                headers={"X-User-Token": remembered}, timeout=10,
             )
         except requests.RequestException:
             me = None
@@ -670,8 +749,37 @@ if USING_API and not st.session_state.token:
             st.session_state.token = remembered
             st.session_state.username = data["username"]
             st.session_state.is_admin = bool(data.get("is_admin"))
-        else:
-            _write_session_cookie(None)  # expired/invalid — drop it
+            st.session_state._admin_checked_at = time.time()
+        elif me is not None and me.status_code in (401, 403):
+            _write_session_cookie(None)  # expired/revoked — drop it
+        # network error: keep the cookie, try again on the next load
+
+# ---------------- LIVE ROLE REFRESH ----------------
+# is_admin was captured at login and then never refreshed, so granting admin
+# in the database (or via the Admin page) appeared to do nothing until the
+# user cleared their cookie. Re-check every ADMIN_REFRESH_SECONDS, and drop
+# the session if the token has been revoked/expired meanwhile.
+ADMIN_REFRESH_SECONDS = 30
+
+if USING_API and st.session_state.token and not st.session_state.logged_out:
+    if time.time() - float(st.session_state._admin_checked_at or 0) > ADMIN_REFRESH_SECONDS:
+        try:
+            me = requests.get(f"{API_URL}/auth/me",
+                              headers=api_headers(), timeout=10)
+        except requests.RequestException:
+            me = None
+        st.session_state._admin_checked_at = time.time()
+        if me is not None and me.ok:
+            data = me.json()
+            st.session_state.username = data.get("username") or st.session_state.username
+            st.session_state.is_admin = bool(data.get("is_admin"))
+        elif me is not None and me.status_code in (401, 403):
+            # Token revoked (logout elsewhere) or expired — fail closed.
+            st.session_state.token = None
+            st.session_state.username = None
+            st.session_state.is_admin = False
+            st.session_state.logged_out = True
+            _flash("Session expired — please log in again.", "🔒")
 
 # Keep the cookie fresh on every logged-in run (idempotent; also covers the
 # rerun right after login/signup, which replaces the login form element).
@@ -680,6 +788,14 @@ if USING_API and st.session_state.token:
 
 # ---------------- LOGIN / SIGNUP (API mode) ----------------
 if USING_API and not st.session_state.token:
+    # Rendered on a page that stays on screen, so the browser really does
+    # execute the deletion (a rerun would have killed the iframe first).
+    if st.session_state.logged_out:
+        _write_session_cookie(None)
+    if st.session_state.get("_api_degraded"):
+        st.warning("⚠️ The API is not responding right now — retrying. "
+                   "Your account login will work again as soon as it wakes up.")
+
     hero("3MTT Nextgen Capstone · AI-Powered Hiring",
          "ResumeRank",
          "Screen resumes against any job description in seconds — semantic AI scoring, "
@@ -734,6 +850,20 @@ if USING_API and not st.session_state.token:
     st.stop()
 
 # ---------------- LEGACY LOGIN (API offline) ----------------
+if not USING_API and not ALLOW_LEGACY_LOGIN:
+    # Accounts live in the API/database on this deployment: showing the
+    # env-credential form here would strand real users on a login page they
+    # can never pass. Say what is actually wrong instead.
+    hero("Service temporarily unavailable", "ResumeRank",
+         "The screening API is not responding. Your account and history are "
+         "safe — please retry in a moment.", api_ok=False)
+    st.error(f"❌ Cannot reach the API at {API_URL}. Retrying automatically.")
+    if st.button("🔄 Retry now"):
+        _api_available_cached.clear()
+        st.rerun()
+    footer()
+    st.stop()
+
 if not USING_API:
     import streamlit_authenticator as stauth
 
@@ -795,6 +925,10 @@ if not USING_API:
     if not auth_status:
         st.stop()
     st.session_state.username = name
+    # Keep a handle on the authenticator so the sidebar can offer a working
+    # "Log out" in offline mode too — without this the legacy path had NO way
+    # out of the session at all (the API-mode button is token-gated).
+    st.session_state._legacy_auth = authenticator
 
 # ---------------- SIDEBAR ----------------
 initial = (st.session_state.username or "?")[0].upper()
@@ -822,12 +956,44 @@ if st.session_state.token and st.session_state.is_admin:
 page = st.sidebar.radio("Navigate", nav_options, label_visibility="collapsed")
 
 if st.session_state.token and st.sidebar.button("🚪 Log out", width="stretch"):
+    # 1. Revoke server-side FIRST: the token is a stateless signed blob, so
+    #    without this any copy of the cookie stays valid for days.
+    if USING_API:
+        try:
+            requests.post(f"{API_URL}/auth/logout", headers=api_headers(), timeout=10)
+        except requests.RequestException:
+            pass  # local sign-out must succeed even if the API is asleep
+    # 2. Clear local state and mark the session logged out. The flag stops
+    #    the cookie-restore block above from resurrecting the session from
+    #    the (stale) cookie header of the current page load; the cookie is
+    #    expired on the login page that renders next, where the component
+    #    iframe actually survives long enough to run.
     st.session_state.token = None
     st.session_state.username = None
     st.session_state.is_admin = False
     st.session_state.screen = None
-    if USING_API:
-        _write_session_cookie(None)  # forget the remembered session
+    st.session_state.logged_out = True
+    st.session_state._admin_checked_at = 0.0
+    _flash("Signed out — see you soon 👋", "🔒")
+    st.rerun()
+
+if not USING_API and st.session_state.username and st.sidebar.button(
+        "🚪 Log out", width="stretch", key="legacy_logout"):
+    # Offline/legacy mode: clear streamlit-authenticator's cookie through its
+    # own API (signature differs across 0.3.x / 0.4.x), then wipe local state.
+    legacy_auth = st.session_state.get("_legacy_auth")
+    for call in (lambda: legacy_auth.logout(location="unrendered"),
+                 lambda: legacy_auth.logout("Log out", "unrendered"),
+                 lambda: legacy_auth.logout("Log out", "sidebar")):
+        try:
+            call()
+            break
+        except Exception:
+            continue
+    for key in ("username", "screen", "name", "authentication_status", "_legacy_auth"):
+        st.session_state.pop(key, None)
+    st.session_state.username = None
+    _flash("Signed out 👋", "🔒")
     st.rerun()
 
 st.sidebar.markdown(
@@ -997,6 +1163,40 @@ if page == "🛠 Admin":
             st.caption("No users yet.")
 
     with st.container(border=True):
+        card_title("🛡 Roles & Access")
+        st.caption("Grant or revoke the admin role. Changes take effect for "
+                   "that user within 30 seconds — no re-login needed.")
+        if ub["users"]:
+            acol1, acol2, acol3 = st.columns([2, 1, 1])
+            with acol1:
+                target = st.selectbox(
+                    "User", options=ub["users"],
+                    format_func=lambda u: (f"{u['username']} "
+                                           f"({'admin' if u['is_admin'] else 'recruiter'})"),
+                    key="rbac_user",
+                )
+            grant = acol2.button("⬆️ Make admin", width="stretch")
+            revoke = acol3.button("⬇️ Revoke admin", width="stretch")
+            if target and (grant or revoke):
+                try:
+                    r = requests.post(
+                        f"{API_URL}/admin/users/{target['id']}/admin",
+                        json={"is_admin": bool(grant)},
+                        headers=api_headers(), timeout=15,
+                    )
+                except requests.RequestException as exc:
+                    st.error(f"Could not update role: {exc}")
+                else:
+                    if r.ok:
+                        _flash(f"{target['username']} is now "
+                               f"{'an admin' if grant else 'a recruiter'}.", "🛡")
+                        if target["username"] == st.session_state.username:
+                            st.session_state._admin_checked_at = 0.0
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {_api_error_detail(r)}")
+
+    with st.container(border=True):
         card_title("🔎 Per-User Drill-Down")
         if ub["users"]:
             choice = st.selectbox(
@@ -1035,8 +1235,7 @@ if page == "🗂 My History":
         st.error(f"Could not load history: {exc}")
         st.stop()
     if resp.status_code == 401:
-        st.session_state.token = None
-        st.warning("Session expired — please log in again.")
+        _drop_session("Session expired — please log in again.")
         st.rerun()
 
     jobs = resp.json()["jobs"]

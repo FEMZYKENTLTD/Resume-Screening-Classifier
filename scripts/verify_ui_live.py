@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""21-check LIVE end-to-end verification for ResumeRank.
+"""32-check LIVE end-to-end verification for ResumeRank.
 
 Drives the *actually running* stack — no mocks:
 
@@ -10,6 +10,9 @@ Drives the *actually running* stack — no mocks:
   4. every UI page rendered headlessly via streamlit.testing.AppTest
      (login, screening, analytics, history, admin) with zero exceptions,
      including the admin 401/403 gate
+  5. session lifecycle: /auth/logout really revokes the token, the user can
+     log back in, and the sidebar "Log out" button clears the UI session
+  6. role stability: an admin stays an admin across re-login
 
 Usage:
     pip install streamlit[testing] fpdf2 requests        # + repo requirements
@@ -162,6 +165,53 @@ check("admin page hidden from non-admin", "🛠 Admin" not in opts)
 switch(at2, "🗂 My History")
 check("history page (demo user), no exception", not at2.exception)
 check("demo user history has dataframe rows", len(at2.dataframe) >= 1)
+
+# ---------- 5. session lifecycle: logout really logs out ----------
+# Regression guard for the two reported production defects.
+logout_login = requests.post(f"{API}/auth/login",
+                             json={"username": DEMO_USER, "password": DEMO_PASS}, timeout=10)
+throwaway_tok = logout_login.json()["token"]
+check("logout endpoint 200",
+      requests.post(f"{API}/auth/logout",
+                    headers={"X-User-Token": throwaway_tok}, timeout=10).ok)
+check("token revoked after logout (stale cookie cannot resurrect it)",
+      requests.get(f"{API}/auth/me",
+                   headers={"X-User-Token": throwaway_tok}, timeout=10).status_code == 401)
+relogin = requests.post(f"{API}/auth/login",
+                        json={"username": DEMO_USER, "password": DEMO_PASS}, timeout=10)
+check("can log back in after logout", relogin.ok)
+demo_tok = relogin.json()["token"]
+
+# ---------- 6. admin role is stable and live ----------
+check("admin flag survives re-login (no silent demotion)",
+      requests.post(f"{API}/auth/login",
+                    json={"username": ADMIN_USER, "password": ADMIN_PASS},
+                    timeout=10).json().get("is_admin") is True)
+check("non-admin blocked from /admin/overview (403)",
+      requests.get(f"{API}/admin/overview",
+                   headers={"X-User-Token": demo_tok}, timeout=10).status_code == 403)
+check("admin sees the Roles & Access control",
+      any("Roles & Access" in (m.value or "") for m in at.markdown))
+
+# ---------- 7. UI logout button clears the session ----------
+at3 = AppTest.from_file(APP_PATH, default_timeout=40)
+at3.session_state["token"] = admin_tok
+at3.session_state["username"] = ADMIN_USER
+at3.session_state["is_admin"] = True
+at3.run()
+logout_btn = [b for b in at3.sidebar.button if "Log out" in (b.label or "")]
+check("log out button present", bool(logout_btn))
+if logout_btn:
+    logout_btn[0].click().run()
+    check("UI logout clears the token", at3.session_state["token"] is None)
+    check("UI logout marks the session logged out (blocks cookie restore)",
+          at3.session_state["logged_out"] is True)
+    check("logged-out UI shows the login form", any("Login" in (t.label or "") for t in at3.tabs))
+    check("logged-out UI has no exception", not at3.exception)
+    # admin_tok was revoked by the button: mint a new one for anything after.
+    admin_tok = requests.post(f"{API}/auth/login",
+                              json={"username": ADMIN_USER, "password": ADMIN_PASS},
+                              timeout=10).json()["token"]
 
 print(f"\n== RESULT: {len(PASS)} passed, {len(FAIL)} failed ==")
 sys.exit(1 if FAIL else 0)

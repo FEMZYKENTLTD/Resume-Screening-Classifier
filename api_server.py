@@ -5,7 +5,9 @@ Endpoints:
   GET  /health             -> liveness probe
   GET  /metrics            -> Prometheus scrape target
   POST /auth/signup        -> create an account (bcrypt), returns token
-  POST /auth/login         -> returns token (case-insensitive username, synced is_admin)
+  POST /auth/login         -> returns token (case-insensitive username, is_admin resolved)
+  GET  /auth/me            -> validate a token, return the CURRENT user record
+  POST /auth/logout        -> revoke every token for the caller (token_version++)
   POST /single_analyze     -> SYNCHRONOUS parse, score, extract, and persist (blazing fast, no worker needed)
   GET  /results/{job_id}   -> get results directly
   GET  /history            -> the calling user's past analyses (X-User-Token)
@@ -18,6 +20,7 @@ import datetime as dt
 import json
 import logging
 import os
+import pathlib
 import time
 import traceback
 import uuid
@@ -47,7 +50,14 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-app = FastAPI(title="Resume Classifier API (Sync)", version="5.7.0")
+# Single source of truth for the release number (see the VERSION file).
+try:
+    APP_VERSION = (pathlib.Path(__file__).with_name("VERSION")
+                   .read_text(encoding="utf-8").strip() or "1.0.0")
+except OSError:                                  # pragma: no cover - packaging
+    APP_VERSION = "1.0.0"
+
+app = FastAPI(title="ResumeRank API", version=APP_VERSION)
 
 MAX_RESUME_BYTES = 10 * 1024 * 1024  # 10 MB safety cap
 MAX_JD_CHARS = 20000                 # pasted-JD sanity cap
@@ -56,11 +66,34 @@ MAX_RESUME_CHARS = 200000            # parsed-text sanity cap (Postgres TEXT)
 # Set DEBUG_ERRORS=1 to echo the exception type/message in 5xx responses.
 DEBUG_ERRORS = os.environ.get("DEBUG_ERRORS", "0").lower() in ("1", "true", "yes")
 
-ADMIN_USERNAMES = {
-    u.strip().lower()
-    for u in os.environ.get("ADMIN_USERNAMES", "admin").split(",")
-    if u.strip()
-}
+def _env_set(name: str, default: str = "") -> set:
+    return {
+        v.strip().lower()
+        for v in os.environ.get(name, default).split(",")
+        if v.strip()
+    }
+
+
+# Usernames/emails that are ALWAYS admins (checked at signup and login).
+# These only ever GRANT admin — see _sync_admin_flag(): a user promoted
+# directly in the database (or through /admin/users/{id}/admin) must never be
+# silently demoted just because their name is not on this list.
+ADMIN_USERNAMES = _env_set("ADMIN_USERNAMES", "admin")
+ADMIN_EMAILS = _env_set("ADMIN_EMAILS")
+
+# Opt-in: mirror the env lists exactly, demoting anyone not on them. Off by
+# default — the old always-sync behaviour wiped is_admin for the project owner
+# on every login.
+ADMIN_STRICT_SYNC = os.environ.get("ADMIN_STRICT_SYNC", "0").lower() in ("1", "true", "yes")
+
+# Owner bootstrap: if the instance has NO admin at all, the very first (i.e.
+# oldest) account is treated as the owner and promoted — at signup on an empty
+# database, or on login for a deployment that already has users but lost its
+# admin. Scoped to the oldest account only, so a stranger signing up on a
+# public instance can never grab it. Disable with ADMIN_BOOTSTRAP_FIRST_USER=0.
+ADMIN_BOOTSTRAP_FIRST_USER = os.environ.get(
+    "ADMIN_BOOTSTRAP_FIRST_USER", "1"
+).lower() in ("1", "true", "yes")
 
 app.add_middleware(
     CORSMiddleware,
@@ -118,9 +151,36 @@ def metrics():
 
 
 def _current_user_id(x_user_token: str | None) -> int | None:
+    """Resolve a session token to a user id.
+
+    Two gates, not one: the signature/expiry must be valid AND the token's
+    version claim must still match users.token_version. A logged-out (or
+    force-revoked) token therefore stops working immediately, even if the
+    browser hangs on to the cookie.
+    """
     if not x_user_token:
         return None
-    return auth.verify_token(x_user_token)
+    decoded = auth.decode_token(x_user_token)
+    if decoded is None:
+        return None
+    user_id, token_version = decoded
+    db = SessionLocal()
+    try:
+        current = db.query(User.token_version).filter(User.id == user_id).first()
+    except SQLAlchemyError as exc:
+        # e.g. the token_version migration has not been applied yet. Degrade
+        # to signature-only validation (the pre-token_version behaviour) instead of
+        # locking every user out of their account.
+        logger.warning("token_version check unavailable (%s); "
+                       "run 'alembic upgrade head'", exc)
+        return user_id
+    finally:
+        db.close()
+    if current is None:                          # user deleted
+        return None
+    if int(current[0] or 0) != int(token_version):
+        return None                              # revoked by logout
+    return user_id
 
 
 def _require_user_id(x_user_token: str | None) -> int:
@@ -156,12 +216,59 @@ class SignupRequest(Credentials):
     password: str = Field(min_length=8, max_length=128)
 
 
-def _is_admin_name(username: str) -> bool:
-    return (username or "").strip().lower() in ADMIN_USERNAMES
+def _is_admin_name(username: str, email: str | None = None) -> bool:
+    """True when the account is named on the env allow-lists."""
+    if (username or "").strip().lower() in ADMIN_USERNAMES:
+        return True
+    return bool(email) and email.strip().lower() in ADMIN_EMAILS
+
+
+def _sync_admin_flag(db, user: User) -> bool:
+    """Reconcile users.is_admin with the env allow-lists.
+
+    GRANT-ONLY by default. The previous implementation assigned
+    ``user.is_admin = username in ADMIN_USERNAMES`` on every login, so an
+    owner who had flipped the flag in the database was demoted the next time
+    they signed in — the "my admin account is not an admin" bug. Set
+    ADMIN_STRICT_SYNC=1 to restore mirror-exactly behaviour.
+    """
+    listed = _is_admin_name(user.username, user.email)
+    changed = False
+    if listed and not user.is_admin:
+        user.is_admin = True
+        changed = True
+    elif ADMIN_STRICT_SYNC and user.is_admin and not listed:
+        user.is_admin = False
+        changed = True
+    if changed:
+        db.commit()
+        db.refresh(user)
+    return bool(user.is_admin)
+
+
+def _no_admin_exists(db) -> bool:
+    return db.query(User).filter(User.is_admin.is_(True)).count() == 0
+
+
+def _is_owner_account(db, user: User) -> bool:
+    """True when `user` is the oldest account on the instance."""
+    first_id = db.query(func.min(User.id)).scalar()
+    return first_id is not None and int(first_id) == int(user.id)
+
+
+def _bootstrap_owner(db, user: User) -> None:
+    """Promote the owner when the instance has no admin left."""
+    if not ADMIN_BOOTSTRAP_FIRST_USER or user.is_admin:
+        return
+    if _no_admin_exists(db) and _is_owner_account(db, user):
+        user.is_admin = True
+        db.commit()
+        db.refresh(user)
+        logger.info("bootstrapped admin rights for owner account %r", user.username)
 
 
 def _user_payload(user: User) -> dict:
-    token = auth.create_token(user.id)
+    token = auth.create_token(user.id, getattr(user, "token_version", 0) or 0)
     return {
         "token": token,
         "user_id": user.id,
@@ -188,7 +295,11 @@ def signup(payload: SignupRequest):
             username=payload.username.strip(),
             email=payload.email.strip(),
             password_hash=auth.hash_password(payload.password),
-            is_admin=_is_admin_name(payload.username),
+            is_admin=(
+                _is_admin_name(payload.username, payload.email)
+                # First account ever created on this instance = the owner.
+                or (ADMIN_BOOTSTRAP_FIRST_USER and db.query(User).count() == 0)
+            ),
         )
         db.add(user)
         try:
@@ -228,14 +339,48 @@ def login(payload: Credentials):
             payload.password, user.password_hash or ""
         ):
             raise HTTPException(status_code=401, detail="Invalid username or password")
-        
-        should_be = _is_admin_name(user.username)
-        if bool(user.is_admin) != should_be:
-            user.is_admin = should_be
-            db.commit()
+
+        # Grant-only reconciliation (never demotes a DB/API-granted admin),
+        # plus owner bootstrap if the instance still has no admin at all.
+        _sync_admin_flag(db, user)
+        _bootstrap_owner(db, user)
         return _user_payload(user)
     finally:
         db.close()
+
+
+@app.post("/auth/logout")
+def logout(x_user_token: str | None = Header(default=None)):
+    """Revoke the caller's sessions.
+
+    Tokens are stateless signed blobs, so "logging out" client-side only
+    works if the browser really drops the cookie — it frequently did not,
+    and the UI then restored the session on the next page load. Bumping
+    users.token_version invalidates every token issued so far, making logout
+    authoritative regardless of what the browser does.
+
+    Idempotent: an already-invalid/absent token returns 200 too, so the UI
+    can always clear local state.
+    """
+    decoded = auth.decode_token(x_user_token) if x_user_token else None
+    if decoded is None:
+        return {"status": "logged_out", "revoked": False}
+    user_id, _tv = decoded
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if user is None:
+            return {"status": "logged_out", "revoked": False}
+        user.token_version = int(user.token_version or 0) + 1
+        db.commit()
+        return {"status": "logged_out", "revoked": True}
+    except SQLAlchemyError as exc:               # pragma: no cover - infra
+        db.rollback()
+        logger.error("logout failed: %s", exc)
+        return {"status": "logged_out", "revoked": False}
+    finally:
+        db.close()
+
 
 @app.get("/auth/me")
 def auth_me(x_user_token: str | None = Header(default=None)):
@@ -693,6 +838,52 @@ def admin_users(x_user_token: str | None = Header(default=None)):
                 "last_active": la.isoformat() if la else None,
             })
         return {"total": len(out), "users": out}
+    finally:
+        db.close()
+
+
+class AdminFlag(BaseModel):
+    is_admin: bool
+
+
+@app.post("/admin/users/{uid}/admin")
+def admin_set_admin(uid: int, payload: AdminFlag,
+                    x_user_token: str | None = Header(default=None)):
+    """Grant or revoke admin rights for a user (admins only).
+
+    Guards against locking the instance out of its own admin dashboard:
+    the last remaining admin cannot be demoted.
+    """
+    caller_id = _require_admin(x_user_token)
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == uid).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        if not payload.is_admin:
+            admins = db.query(User).filter(User.is_admin.is_(True)).count()
+            if user.is_admin and admins <= 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cannot revoke the last remaining admin",
+                )
+            if user.id == caller_id and _is_admin_name(user.username, user.email):
+                raise HTTPException(
+                    status_code=409,
+                    detail=("This account is admin by configuration "
+                            "(ADMIN_USERNAMES/ADMIN_EMAILS); remove it there first"),
+                )
+        user.is_admin = bool(payload.is_admin)
+        db.commit()
+        db.refresh(user)
+        return {"id": user.id, "username": user.username,
+                "is_admin": bool(user.is_admin)}
+    except HTTPException:
+        raise
+    except SQLAlchemyError as exc:               # pragma: no cover - infra
+        db.rollback()
+        logger.error("admin flag update failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Storage backend unavailable")
     finally:
         db.close()
 

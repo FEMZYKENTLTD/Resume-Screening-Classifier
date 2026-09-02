@@ -3,12 +3,15 @@
 # Install the runtime stack first, then this file:
 #   pip install -r requirements.txt -r requirements-dev.txt
 #
-# CI NOTE: .github/workflows/deploy.yml still does an unpinned
-#   pip install pytest httpx
-# because the Arena GitHub App token lacks the 'workflows' permission and
-# cannot push workflow edits. Apply the one-line fix manually:
-#   cp docs/deploy.yml.node24 .github/workflows/deploy.yml
-# (that copy already installs -r requirements-dev.txt instead).
+# CI NOTE: .github/workflows/deploy.yml currently installs `pytest httpx`
+# unpinned, because the Arena GitHub App token has no 'workflows' permission
+# and cannot push workflow edits. To pin CI to this file, change those two
+# lines in the workflow to one:
+#
+#     pip install -r requirements.txt -r requirements-dev.txt
+#
+# (Everything else in the workflow is already current: checkout@v7,
+# setup-python@v7, flyctl-actions/setup-flyctl@v1 - Node 24 ready.)
 #
 # These are NOT installed in the production images (Dockerfile.api /
 # .worker / .streamlit) — test tooling has no business in a deploy artifact.
@@ -24,7 +27,7 @@ httpx==0.28.1          # REQUIRED by fastapi.testclient.TestClient (starlette
 # --- Optional ML extras, pinned so CI can exercise the ML code paths ---
 # The app degrades gracefully without these (see requirements.txt), but the
 # full test suite only reaches the classifier/NER branches when they exist.
-# Uncomment, or install in a dedicated "ml" CI job, to run all 81 tests
-# instead of the 72-pass / 9-skip bare run.
+# Uncomment, or install in a dedicated "ml" CI job, to reach 88 passed /
+# 1 skip instead of the bare 79-pass / 10-skip run (89 tests collected).
 # scikit-learn==1.9.0
 # spacy==3.8.16

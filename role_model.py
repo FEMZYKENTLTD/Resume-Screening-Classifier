@@ -15,7 +15,7 @@ MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "models", "role_classifier.joblib")
 
 # Serving decision rule. These are DEFAULTS: if the artifact records its own
-# min_confidence / min_margin (v5.7+), those win, so the model and the rule it
+# min_confidence / min_margin, those win, so the model and the rule it
 # was validated under can never drift apart.
 #
 # Why a margin and not just a threshold: TF-IDF probabilities over 8 classes on
