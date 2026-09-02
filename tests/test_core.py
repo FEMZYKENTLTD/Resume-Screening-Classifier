@@ -33,6 +33,7 @@ from database import engine  # noqa: E402
 from extractors import extract_fields  # noqa: E402
 from models import Base  # noqa: E402
 from roles import classify_role, classify_role_keywords, classify_role_with_method  # noqa: E402
+import scoring  # noqa: E402
 from scoring import overlap_score  # noqa: E402
 from skills import extract_skills  # noqa: E402
 
@@ -627,7 +628,7 @@ def test_error_responses_do_not_leak_internals(client, monkeypatch):
     """5xx bodies must stay generic unless DEBUG_ERRORS is set."""
     import api_server
 
-    monkeypatch.setattr(api_server, "overlap_score",
+    monkeypatch.setattr(api_server.scoring, "score_details",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("secret db dsn")))
     raw = _sample_pdf("Leak Test " + uuid.uuid4().hex)
     r = client.post("/single_analyze",
@@ -1048,3 +1049,203 @@ def test_admin_user_jobs_returns_columns_the_ui_renders(client):
                 "status", "skills_extracted", "created_at"}
     missing = required - set(jobs[0])
     assert not missing, f"admin drill-down would KeyError on: {missing}"
+
+
+# ---------------- regression: "every candidate gets the same generic number" ----------------
+
+_PROSE_JD = (
+    "Senior Data Engineer (Lagos, hybrid)\n"
+    "We are looking for a Senior Data Engineer to join our team and own our "
+    "analytics pipelines in a fast paced environment.\n"
+    "Must have: 5+ years of experience with Python and SQL, Apache Airflow, "
+    "dbt, Spark, and a data warehouse such as Snowflake or BigQuery. "
+    "Experience with Kafka streaming and ETL pipeline design is required. "
+    "Docker and Kubernetes knowledge is a plus.\n"
+    "Strong communication skills and the ability to work with stakeholders. "
+    "B.Sc degree preferred. Please send your CV."
+)
+
+_BOILERPLATE_RESUME = (
+    "John Smith\nLagos, Nigeria\n"
+    "I have several years of experience working with a team.\n"
+    "Responsible for delivery and collaboration in a fast paced environment.\n"
+    "Strong communication skills. References available on request.\n"
+    "B.Sc from a university."
+)
+
+
+def test_boilerplate_resume_does_not_score_like_a_real_candidate():
+    """THE BUG: stopwords and recruiter boilerplate ('and', 'of', 'with',
+    'experience', 'years', 'team') were counted as keyword matches, so a
+    resume with ZERO relevant skills scored the same generic number as a
+    genuine candidate. Measured on the real demo JD: boilerplate 14% vs the
+    real data analyst 14%. Indistinguishable."""
+    boiler, _ = overlap_score(_BOILERPLATE_RESUME, _PROSE_JD)
+    assert boiler <= 5, f"boilerplate resume still scores {boiler}%"
+
+    real = (
+        "Tunde Bakare\nSenior Data Engineer\n"
+        "Python, SQL, Apache Airflow, dbt, Spark, BigQuery, Kafka, ETL "
+        "pipelines, data warehouse modeling, Docker, Kubernetes."
+    )
+    real_score, _ = overlap_score(real, _PROSE_JD)
+    assert real_score >= 50, f"real candidate only scores {real_score}%"
+    # The whole point: they must be clearly distinguishable.
+    assert real_score - boiler >= 40
+
+
+def test_pure_stopwords_score_zero():
+    score, matched = overlap_score(
+        "the and of in a with for to is on at by from as an be", _PROSE_JD)
+    assert score == 0
+    assert matched == []
+
+
+def test_matched_keywords_contain_no_stopwords():
+    """The UI renders these as 'Matched Keywords' and feeds them to the skill
+    cloud — 'and'/'of'/'the' made that output worthless."""
+    _score, matched = overlap_score(
+        "Python SQL Airflow experience with years of teamwork and delivery",
+        _PROSE_JD)
+    for junk in ("and", "of", "with", "the", "years", "experience", "team"):
+        assert junk not in matched, f"stopword '{junk}' leaked into matches"
+    assert "python" in matched and "airflow" in matched
+
+
+def test_scores_spread_across_the_range():
+    """Compressed scores all look alike. Dividing by EVERY JD word (not just
+    the meaningful ones) crushed the dynamic range into a narrow band."""
+    candidates = {
+        "perfect": "Python SQL Apache Airflow dbt Spark Snowflake BigQuery "
+                   "Kafka ETL pipeline data warehouse Docker Kubernetes",
+        "partial": "Python SQL and some reporting work",
+        "unrelated": "Swift SwiftUI Xcode iOS App Store mobile design",
+    }
+    scores = {k: overlap_score(v, _PROSE_JD)[0] for k, v in candidates.items()}
+    assert scores["perfect"] > scores["partial"] > scores["unrelated"]
+    assert scores["perfect"] >= 60, scores
+    assert scores["unrelated"] <= 10, scores
+
+
+def test_each_demo_resume_scores_highest_against_its_own_role():
+    """End-to-end sanity on REAL PDFs: the ranking must be defensible."""
+    demo_dir = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "demo", "resumes")
+    jds = {
+        "data_eng": "Senior Data Engineer. Python, SQL, Apache Airflow, dbt, "
+                    "Spark, Snowflake, BigQuery, Kafka, ETL pipelines, data "
+                    "warehouse modeling, Docker, Kubernetes.",
+        "frontend": "Frontend Engineer. React, TypeScript, JavaScript, HTML, "
+                    "CSS, Tailwind, responsive design, accessibility, Jest.",
+        "data_sci": "Data Scientist. Python, pandas, numpy, scikit-learn, "
+                    "PyTorch, TensorFlow, machine learning, NLP, statistics.",
+        "analyst": "Data Analyst. Advanced SQL, Power BI, Tableau, Excel, "
+                   "dashboards, KPI reporting, data visualization.",
+    }
+    expected_best = {
+        "tunde_bakare_data_engineer.pdf": "data_eng",
+        "ibrahim_musa_frontend.pdf": "frontend",
+        "fatima_bello_data_scientist.pdf": "data_sci",
+        "chiamaka_eze_data_analyst.pdf": "analyst",
+    }
+    for filename, want in expected_best.items():
+        path = os.path.join(demo_dir, filename)
+        if not os.path.exists(path):
+            pytest.skip(f"{filename} missing")
+        text = parsing.parse_resume(filename, open(path, "rb").read())
+        scores = {k: overlap_score(text, v)[0] for k, v in jds.items()}
+        best = max(scores, key=scores.get)
+        assert best == want, f"{filename}: best={best} scores={scores}"
+
+
+def test_score_details_exposes_gaps():
+    d = scoring.score_details(
+        "Python SQL Airflow only", _PROSE_JD)
+    assert d["algorithm"] == "weighted-keyword-coverage"
+    assert 0 <= d["score"] <= 100
+    assert "python" in d["matched"]
+    # missing requirements are surfaced, most important first
+    assert d["missing"], "expected unmet requirements to be reported"
+    assert "spark" in d["missing"] or "spark" in d["missing_skills"]
+
+
+def test_scoring_handles_empty_inputs():
+    assert overlap_score("", _PROSE_JD)[0] == 0
+    assert overlap_score("Python", "")[0] == 0
+    assert overlap_score("", "")[0] == 0
+    assert overlap_score(None or "", _PROSE_JD)[0] == 0
+
+
+def test_identical_resume_and_jd_scores_100():
+    text = "Python SQL Airflow dbt Spark Kafka"
+    assert overlap_score(text, text)[0] == 100
+
+
+# ---------------------------------------------------------------------------
+# Pseudonymization of REAL resumes (training/pseudonymize.py)
+# ---------------------------------------------------------------------------
+
+from training.pseudonymize import pseudonymize, contains_pii  # noqa: E402
+
+_REAL_SHAPED_CV = """Olufemi B. Keripe
+14 Adeniyi Jones Avenue, Ikeja, Lagos
+olufemi.keripe@gmail.com | +234 803 412 7788
+linkedin.com/in/olufemi-keripe
+Date of Birth: 12/04/1988
+BVN: 22145879632
+
+SENIOR DATA ENGINEER
+Skills: Python, Airflow, dbt, Snowflake, Kafka, Spark
+Interswitch Ltd - Lead Data Engineer (2021 - Present)
+Andela - Data Engineer (2018 - 2021)
+B.Sc Computer Science, University of Ibadan
+"""
+
+
+def test_pseudonymize_removes_direct_identifiers():
+    safe, report = pseudonymize(_REAL_SHAPED_CV)
+    assert "Keripe" not in safe
+    assert "olufemi.keripe@gmail.com" not in safe
+    assert "803 412 7788" not in safe
+    assert "22145879632" not in safe
+    assert "12/04/1988" not in safe
+    assert "linkedin.com/in/olufemi-keripe" not in safe
+    assert report["email"] == 1 and report["name"] == 1
+
+
+def test_pseudonymize_preserves_training_signal():
+    """Scrubbing must not destroy the skills the classifier learns from."""
+    safe, _ = pseudonymize(_REAL_SHAPED_CV)
+    for skill in ("Python", "Airflow", "dbt", "Snowflake", "Kafka", "Spark"):
+        assert skill in safe, skill
+    assert "DATA ENGINEER" in safe
+
+
+def test_pseudonymize_keeps_employment_date_ranges():
+    """Regression: a naive phone regex ate '2018 - 2021' as a phone number."""
+    safe, _ = pseudonymize(_REAL_SHAPED_CV)
+    assert "2018 - 2021" in safe
+    assert "2021 - Present" in safe
+
+
+def test_pseudonymize_output_passes_its_own_pii_audit():
+    """The scrubber and the auditor must agree, or everything is rejected."""
+    safe, _ = pseudonymize(_REAL_SHAPED_CV)
+    assert contains_pii(safe) == []
+
+
+def test_contains_pii_detects_unscrubbed_text():
+    found = contains_pii(_REAL_SHAPED_CV)
+    assert "email" in found and "phone" in found
+
+
+def test_pseudonym_is_stable_and_not_the_real_name():
+    a, _ = pseudonymize(_REAL_SHAPED_CV)
+    b, _ = pseudonymize(_REAL_SHAPED_CV)
+    assert a.splitlines()[0] == b.splitlines()[0]
+    assert "Olufemi" not in a.splitlines()[0]
+
+
+def test_pseudonymize_handles_empty_input():
+    safe, report = pseudonymize("")
+    assert safe == "" and report["name"] == 0

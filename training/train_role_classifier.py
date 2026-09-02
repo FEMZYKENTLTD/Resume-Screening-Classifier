@@ -231,7 +231,45 @@ HELDOUT = [
 # the generated rows supply realistic volume and scaffolding noise.
 CURATED = list(DATA)
 GENERATED = make_dataset(split="train", per_role=GENERATED_PER_ROLE)
-DATA = CURATED + GENERATED
+
+
+def _load_real_corpus():
+    """Pseudonymized REAL resumes, if the operator has ingested any.
+
+    Produced by `python -m training.ingest_real_resumes`. Real CVs are the
+    highest-value training signal available — synthetic data teaches document
+    shape, real ones teach the messy vocabulary people actually write. The
+    file is optional so the repo still trains out of the box.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "real_corpus.jsonl")
+    if not os.path.exists(path):
+        return []
+    rows = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            text, label = obj.get("text"), obj.get("label")
+            if text and label:
+                rows.append((text, label))
+    return rows
+
+
+REAL = _load_real_corpus()
+if REAL:
+    print(f"→ using {len(REAL)} pseudonymized REAL resumes from "
+          f"training/real_corpus.jsonl")
+
+# Real resumes are the most valuable rows, so they are repeated to carry more
+# weight than synthetic ones without needing a separate sample_weight path.
+REAL_OVERSAMPLE = int(os.environ.get("REAL_OVERSAMPLE", "3"))
+DATA = CURATED + GENERATED + REAL * REAL_OVERSAMPLE
 
 # A second, fully held-out generated set drawn from DISJOINT name/employer/
 # city pools and a different seed, plus the hand-written HELDOUT probes.

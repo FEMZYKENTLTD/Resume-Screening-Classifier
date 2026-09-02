@@ -36,6 +36,7 @@ from database import SessionLocal
 from extractors import extract_fields
 from models import JobStatus, ResumeResult, User
 from roles import classify_role_with_method
+import scoring
 from scoring import overlap_score
 from skills import extract_skills
 from tasks import make_dedup_hash
@@ -348,15 +349,24 @@ async def single_analyze(
             )
         text = parsing.sanitize_text(text)[:MAX_RESUME_CHARS]
 
-        keyword_score, _overlap = overlap_score(text, jd)
+        breakdown = scoring.score_details(text, jd)
+        keyword_score = breakdown["score"]
 
         # The ML extras (spaCy NER, sklearn role model) are OPTIONAL by design
         # (README: "graceful degradation"). A missing model file, an OOM-killed
         # spaCy load or a corrupt joblib artifact must degrade the result, not
         # 500 the request — this was the production failure mode.
+        # Surface WHY a candidate scored what they did — matched vs missing
+        # requirements make the number explainable instead of arbitrary.
         details = {
-            "algorithm": "keyword-overlap",
+            "algorithm": breakdown["algorithm"],
             "keyword_score": keyword_score,
+            "coverage": breakdown["coverage"],
+            "jd_terms": breakdown["jd_terms"],
+            "matched_terms": breakdown["matched"][:40],
+            "missing_terms": breakdown["missing"][:25],
+            "matched_skills": breakdown["matched_skills"],
+            "missing_skills": breakdown["missing_skills"],
         }
 
         try:

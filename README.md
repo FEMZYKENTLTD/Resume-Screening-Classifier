@@ -87,7 +87,7 @@ Streamlit UI  ──POST /single_analyze──▶  FastAPI  ──▶ parse → 
 | Feature | Detail |
 |---|---|
 | 📄 **PDF + DOCX parsing** | PyMuPDF + python-docx, multi-file batch upload |
-| 🎯 **Match score (0–100 %)** | Keyword/skill overlap normalized to a percentage |
+| 🎯 **Match score (0–100 %)** | Meaningful-term overlap: stopwords excluded, log-damped term frequency, 2× weight for known tech skills. Returns the matched **and missing** skills, not just a number |
 | 🧠 **Semantic matching** *(optional)* | `ENABLE_SEMANTIC=1` — sentence-transformers embeddings blended `0.65 semantic / 0.35 keyword`, with **skill-gap analysis** |
 | 🔍 **Field extraction** | name, email, phone, years of experience, education, organizations |
 | 🏆 **Rankings & badges** | Animated leaderboard (🥇🥈🥉), CSV/PDF export |
@@ -200,7 +200,10 @@ Resume-Screening-Classifier/
 ├── 📄 skills.py                # curated tech-skill lexicon
 ├── 📄 roles.py                 # keyword-profile role classifier (fallback)
 ├── 📄 role_model.py            # trained TF-IDF + logistic-regression classifier
-├── 📄 scoring.py               # keyword overlap score (0–100)
+├── 📄 scoring.py               # match score (0–100) + gap analysis
+├── 📁 training/
+│   ├── 📄 pseudonymize.py      # strip PII from REAL resumes (fail-closed audit)
+│   └── 📄 ingest_real_resumes.py # folder of real CVs -> safe training corpus
 ├── 📄 matching_engine.py       # optional semantic matching (sentence-transformers)
 ├── 📄 monitoring.py            # Prometheus helpers
 ├── 📄 models.py                # SQLAlchemy models
@@ -347,12 +350,94 @@ Interactive docs: **`/docs`** on the API (Swagger UI).
 
 ## 🧪 Testing & Verification
 
+### Scoring: why every resume used to get roughly the same number
+
+The original score was a plain set intersection:
+
+```python
+100 * len(set(jd_words) & set(resume_words)) / len(set(jd_words))
+```
+
+Two defects made it nearly useless:
+
+1. **Stopwords counted as matches.** "and", "of", "with", "experience", "years",
+   "team" appear in every JD and every resume, so every candidate collected the
+   same free points — a score *floor*.
+2. **The denominator was every word in the JD**, including that same filler, so
+   real skill matches were diluted into a narrow band.
+
+Measured on the real demo JD, a resume containing **no relevant skills at all**
+scored **14%** — *identical* to a genuine data analyst. A string of pure
+stopwords scored **12%**. That is the "same generic number" effect.
+
+The rewrite (`scoring.py`) fixes it by:
+
+- excluding a `STOPWORDS` set (English filler + recruiter boilerplate + degree
+  and location tokens) from **both** sides,
+- scoring only *meaningful* JD terms, so the denominator reflects real requirements,
+- damping repetition with `1 + ln(count)` so keyword-stuffing cannot game it,
+- weighting known `TECH_SKILLS_DB` skills **2×**,
+- returning `matched_skills` / `missing_skills` so the UI can show the **gap**.
+
+A tokenizer bug surfaced during the fix: trailing punctuation stuck to tokens,
+so `bigquery.` ≠ `bigquery` and genuinely-met requirements were silently
+reported as missing. Tokens are now right-stripped of `.,;:!?)/-` while
+`c++`, `c#`, `ci/cd` and `node.js` survive intact.
+
+| | before | after |
+|---|---|---|
+| boilerplate-only resume | 14% | **0%** |
+| real data engineer (matching JD) | 41% | **80%** |
+
+Each demo resume now scores highest against its own role — a perfect diagonal:
+
+| resume | DataEng | Frontend | DataSci | Analyst |
+|---|---|---|---|---|
+| chiamaka (analyst) | 26 | 0 | 24 | **47** |
+| fatima (data science) | 18 | 0 | **40** | 23 |
+| ibrahim (frontend) | 0 | **32** | 0 | 0 |
+| tunde (data engineering) | **65** | 0 | 12 | 18 |
+
+---
+
+### Training on real resumes (pseudonymized)
+
+Synthetic data teaches document *shape*; real CVs teach the messy vocabulary
+people actually write. Real resumes are also personal data, so they are never
+committed — instead the repo ships the pipeline to ingest your own safely:
+
+```bash
+real_resumes/
+  Data Engineering/       cv1.pdf  cv2.docx
+  Frontend Engineering/   ...
+
+python -m training.ingest_real_resumes real_resumes/
+python -m training.train_role_classifier    # auto-detects the corpus
+```
+
+`training/pseudonymize.py` removes names, emails, phone numbers, URLs and
+social handles, street addresses, dates of birth and national-ID/BVN-style
+numbers, while **preserving** job titles, skills, employers, dates and
+education — the signal the classifier actually learns from. Names become
+*deterministic* pseudonyms, so one person stays consistent across documents
+without the real name ever being stored.
+
+The pipeline **fails closed**: every scrubbed document is re-audited, and any
+that still contains a direct identifier is **rejected, not written**. The
+scrubber and auditor share one `_is_phone()` rule so they cannot disagree.
+`training/real_corpus.jsonl` is git-ignored by default.
+
+> ⚠️ Pseudonymization reduces risk; it does not grant permission. Only ingest
+> resumes you have a lawful basis to process (NDPR / GDPR).
+
+---
+
 Everything claimed above is **machine-verified**, not vibes:
 
 ```bash
-pytest tests/ -q                     # 66 tests — full stack on SQLite + eager Celery
-                                     #   • with spaCy + scikit-learn:   65 passed, 1 model-only skip
-                                     #   • bare CI (no ML extras):      57 passed, 9 auto-skips
+pytest tests/ -q                     # 81 tests — full stack on SQLite + eager Celery
+                                     #   • with spaCy + scikit-learn:   80 passed, 1 model-only skip
+                                     #   • bare CI (no ML extras):      72 passed, 9 auto-skips
 python -m training.train_role_classifier   # retrain + REFUSE to ship a bad model
 python scripts/verify_ui_live.py     # 21 passed — drives the REAL running stack:
                                      # HTTP login → PDF through the pipeline → AppTest on every page
