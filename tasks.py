@@ -70,7 +70,7 @@ def analyze_resume_task(payload_b64: str, filename: str, jd: str, job_id: str,
     db.commit()
 
     try:
-        text = parsing.parse_resume(filename, payload)
+        text = parsing.sanitize_text(parsing.parse_resume(filename, payload))[:200000]
 
         keyword_score, _overlap = overlap_score(text, jd)
         score = keyword_score
@@ -96,16 +96,26 @@ def analyze_resume_task(payload_b64: str, filename: str, jd: str, job_id: str,
             except Exception as exc:  # semantic must never break the pipeline
                 details["semantic_error"] = f"{type(exc).__name__}: {exc}"
 
-        role, role_method, role_confidence = classify_role_with_method(text)
+        try:
+            role, role_method, role_confidence = classify_role_with_method(text)
+        except Exception as exc:   # optional ML extras must degrade, not crash
+            role, role_method, role_confidence = "General / Uncategorized", "unavailable", None
+            details["role_error"] = f"{type(exc).__name__}: {exc}"
+
+        try:
+            extracted = extract_fields(text)
+        except Exception as exc:
+            extracted = {"extraction_method": "unavailable"}
+            details["extraction_error"] = f"{type(exc).__name__}: {exc}"
 
         job.resume_text = text
         job.jd_match_score = score
         job.skills_extracted = ", ".join(sorted(extract_skills(text)))
         job.predicted_role = role
-        job.extracted_fields = json.dumps(extract_fields(text))
+        job.extracted_fields = json.dumps(extracted, ensure_ascii=False, default=str)
         details["role_method"] = role_method
         details["role_confidence"] = role_confidence
-        job.match_details = json.dumps(details)
+        job.match_details = json.dumps(details, ensure_ascii=False, default=str)
         job.status = JobStatus.COMPLETED
         db.commit()
 

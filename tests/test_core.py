@@ -551,3 +551,185 @@ def test_auth_me_roundtrip(client):
     # anonymous / bogus tokens are rejected
     assert client.get("/auth/me").status_code == 401
     assert client.get("/auth/me", headers={"X-User-Token": "bogus"}).status_code == 401
+
+# ---------------- regression: production 500 on /single_analyze ----------------
+
+def test_sanitize_text_strips_db_hostile_characters():
+    """PostgreSQL TEXT rejects NUL and psycopg2 cannot encode lone surrogates;
+    real PDFs contain both. sanitize_text must remove them (root cause of the
+    live 500 on /single_analyze)."""
+    dirty = "Olufemi\x00 Keripe\ud800\r\nSenior\x07 Engineer\x0b\n\n\n\nLagos\u00a0 Nigeria"
+    clean = parsing.sanitize_text(dirty)
+    assert "\x00" not in clean and "\r" not in clean
+    assert "\ud800" not in clean.encode("utf-8", "ignore").decode("utf-8", "ignore")
+    assert clean.encode("utf-8")  # encodable
+    assert "Olufemi Keripe" in clean
+    assert "\n\n\n" not in clean
+    assert parsing.sanitize_text("") == "" and parsing.sanitize_text(None) == ""
+
+
+def test_pdf_parsing_preserves_line_structure():
+    """PDF text used to be joined with spaces, collapsing the CV onto one line
+    and breaking the line-oriented name heuristic."""
+    text = parsing.parse_resume("cv.pdf", _sample_pdf("Olufemi Keripe"))
+    assert "Olufemi Keripe" in text
+    assert "\x00" not in text
+
+
+def test_single_analyze_survives_hostile_pdf_text(client):
+    """A resume full of NULs/control chars must return 200, not 500."""
+    raw = _sample_pdf("Femi\x00 Keripe\x07 Python SQL Docker")
+    r = client.post("/single_analyze",
+                    files={"resume": ("hostile.pdf", raw, "application/pdf")},
+                    data={"jd": JD})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "completed"
+
+
+def test_single_analyze_degrades_when_ml_extras_explode(client, monkeypatch):
+    """Optional ML extras (spaCy NER / sklearn role model) are documented as
+    gracefully degrading. If they raise, the request must still succeed."""
+    import api_server
+
+    def boom(*a, **k):
+        raise RuntimeError("model artifact corrupt")
+
+    monkeypatch.setattr(api_server, "classify_role_with_method", boom)
+    monkeypatch.setattr(api_server, "extract_fields", boom)
+    monkeypatch.setattr(api_server, "extract_skills", boom)
+
+    raw = _sample_pdf("Degraded Candidate Python SQL " + uuid.uuid4().hex)
+    r = client.post("/single_analyze",
+                    files={"resume": ("degraded.pdf", raw, "application/pdf")},
+                    data={"jd": JD})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "completed"
+    assert body["jd_match_score"] >= 0
+    details = body["match_details"]
+    assert "role_error" in details and "extraction_error" in details
+
+
+def test_single_analyze_rejects_empty_and_blank_jd(client):
+    raw = _sample_pdf("Someone Python")
+    assert client.post("/single_analyze",
+                       files={"resume": ("a.pdf", raw, "application/pdf")},
+                       data={"jd": "   "}).status_code == 400
+    assert client.post("/single_analyze",
+                       files={"resume": ("b.pdf", b"", "application/pdf")},
+                       data={"jd": JD}).status_code == 400
+
+
+def test_error_responses_do_not_leak_internals(client, monkeypatch):
+    """5xx bodies must stay generic unless DEBUG_ERRORS is set."""
+    import api_server
+
+    monkeypatch.setattr(api_server, "overlap_score",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("secret db dsn")))
+    raw = _sample_pdf("Leak Test " + uuid.uuid4().hex)
+    r = client.post("/single_analyze",
+                    files={"resume": ("leak.pdf", raw, "application/pdf")},
+                    data={"jd": JD})
+    assert r.status_code == 500
+    assert "secret db dsn" not in r.text
+
+
+def test_safe_json_tolerates_corrupt_rows():
+    from api_server import _safe_json
+    assert _safe_json(None) == {}
+    assert _safe_json("") == {}
+    assert _safe_json("{not json") == {}
+    assert _safe_json('"a string"') == {}
+    assert _safe_json('{"a": 1}') == {"a": 1}
+
+
+def test_analyze_via_api_never_raises(monkeypatch):
+    """app.analyze_via_api must return (None, error) instead of raising —
+    the live UI crashed with requests.HTTPError straight out of Streamlit."""
+    import importlib.util
+    import types
+
+    spec = importlib.util.find_spec("streamlit")
+    if spec is None:
+        pytest.skip("streamlit not installed")
+
+    import requests as _requests
+
+    class _Resp:
+        ok = False
+        status_code = 500
+        text = '{"detail":"Analysis failed"}'
+
+        def json(self):
+            return {"detail": "Analysis failed"}
+
+    # Exercise the pure logic without importing the whole Streamlit script.
+    ns = types.SimpleNamespace()
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "app.py")).read()
+    start = src.index("def analyze_via_api(")
+    end = src.index("\nif run_clicked", start)
+    helper_start = src.index("def _api_error_detail(")
+    helper_end = src.index("\n\n\n", helper_start)
+    glue = {
+        "requests": _requests, "os": os,
+        "_MIME": {".pdf": "application/pdf"},
+        "API_URL": "http://127.0.0.1:9", "API_ANALYZE_TIMEOUT": 5,
+        "api_headers": lambda: {},
+    }
+    exec(compile(src[helper_start:helper_end], "app.py", "exec"), glue)
+    exec(compile(src[start:end], "app.py", "exec"), glue)
+
+    class _File:
+        name = "cv.pdf"
+
+        def seek(self, *_):
+            pass
+
+        def read(self):
+            return b"%PDF-1.4"
+
+    # HTTP 500 from the API
+    glue["requests"] = types.SimpleNamespace(
+        post=lambda *a, **k: _Resp(), exceptions=_requests.exceptions)
+    payload, err = glue["analyze_via_api"](_File(), JD)
+    assert payload is None and "HTTP 500" in err
+
+    # connection blows up entirely
+    def _raise(*a, **k):
+        raise _requests.exceptions.ConnectionError("no route")
+
+    glue["requests"] = types.SimpleNamespace(
+        post=_raise, exceptions=_requests.exceptions)
+    payload, err = glue["analyze_via_api"](_File(), JD)
+    assert payload is None and "could not reach" in err
+
+
+def test_parsed_output_is_postgres_encodable():
+    """Proxy for the live Postgres backend: psycopg2 refuses NUL bytes and
+    lone surrogates. Everything we persist must survive its adapter."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    from psycopg2.extensions import adapt
+
+    hostile = "Femi\x00 Keripe\ud800 \x07Python SQL"
+    text = parsing.sanitize_text(hostile)
+    adapt(text).getquoted()                      # must not raise
+
+    fields = extract_fields(text)
+    adapt(json.dumps(fields, ensure_ascii=False, default=str)).getquoted()
+
+    pdf_text = parsing.parse_resume("cv.pdf", _sample_pdf(hostile))
+    adapt(pdf_text).getquoted()
+
+
+def test_alembic_migrations_have_single_head():
+    """README claims a single linear head auto-applied on deploy. A split head
+    makes `alembic upgrade head` fail at release time and takes the API down."""
+    alembic_config = pytest.importorskip("alembic.config")
+    from alembic.script import ScriptDirectory
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg = alembic_config.Config(os.path.join(root, "alembic.ini"))
+    cfg.set_main_option("script_location", os.path.join(root, "migrations"))
+    heads = ScriptDirectory.from_config(cfg).get_heads()
+    assert len(heads) == 1, f"expected one alembic head, found {heads}"

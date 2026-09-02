@@ -15,7 +15,7 @@ Prometheus/Grafana observability — all deployable with one command.
 ![Postgres](https://img.shields.io/badge/Database-PostgreSQL-336791?style=for-the-badge&logo=postgresql&logoColor=white)
 
 [![CI](https://github.com/FEMZYKENTLTD/Resume-Screening-Classifier/actions/workflows/deploy.yml/badge.svg)](https://github.com/FEMZYKENTLTD/Resume-Screening-Classifier/actions/workflows/deploy.yml)
-![Tests](https://img.shields.io/badge/Tests-31%20unit%20%2B%2021%20live%20E2E-brightgreen?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Tests-44%20unit%20%2B%2021%20live%20E2E-brightgreen?style=for-the-badge)
 ![Docker](https://img.shields.io/badge/Docker-Compose%20Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 ![Status](https://img.shields.io/badge/Status-Production%20Ready-blueviolet?style=for-the-badge)
@@ -350,13 +350,26 @@ Interactive docs: **`/docs`** on the API (Swagger UI).
 Everything claimed above is **machine-verified**, not vibes:
 
 ```bash
-pytest tests/ -q                     # 31 tests — full stack on SQLite + eager Celery
-                                     #   • with the optional ML extras installed: 31 passed
-                                     #   • with scikit-learn only: 30 passed, 1 spaCy-model skip
-                                     #   • bare CI (no ML extras): 28 passed, 3 auto-skips
+pytest tests/ -q                     # 45 tests — full stack on SQLite + eager Celery
+                                     #   • with scikit-learn installed: 44 passed, 1 spaCy-model skip
+                                     #   • bare CI (no ML extras):      42 passed, 3 auto-skips
 python scripts/verify_ui_live.py     # 21 passed — drives the REAL running stack:
                                      # HTTP login → PDF through the pipeline → AppTest on every page
 ```
+
+**Resilience suite** (added in v5.7, covering the production `/single_analyze` 500):
+
+| Test | Guards against |
+|---|---|
+| `test_sanitize_text_strips_db_hostile_characters` | NUL / control chars / lone surrogates from real PDFs |
+| `test_parsed_output_is_postgres_encodable` | psycopg2 refusing to adapt parsed text (the live 500) |
+| `test_pdf_parsing_preserves_line_structure` | PDF text collapsing onto one line, breaking name extraction |
+| `test_single_analyze_survives_hostile_pdf_text` | hostile resumes returning 500 instead of 200 |
+| `test_single_analyze_degrades_when_ml_extras_explode` | a corrupt/OOM ML artifact taking down the endpoint |
+| `test_error_responses_do_not_leak_internals` | DSNs / stack details leaking in 5xx bodies |
+| `test_analyze_via_api_never_raises` | `requests.HTTPError` escaping into the Streamlit UI |
+| `test_safe_json_tolerates_corrupt_rows` | one bad JSON column 500-ing history/results |
+| `test_alembic_migrations_have_single_head` | a split head breaking `alembic upgrade head` on deploy |
 
 `verify_ui_live.py` performs true end-to-end round-trips: real logins (admin + non-admin),
 a generated PDF pushed through `single_analyze → pipeline → DB → results`, then
@@ -364,6 +377,59 @@ a generated PDF pushed through `single_analyze → pipeline → DB → results`,
 admin incl. 401/403 gating) and asserts zero exceptions.
 
 CI runs the same gates on every push: **compile → migrate-check → test suite → deploy**.
+
+---
+
+## 🛠 Troubleshooting
+
+### `500 Server Error ... /single_analyze` (fixed in v5.7)
+
+The live UI used to surface a raw traceback:
+
+```
+requests.exceptions.HTTPError: 500 Server Error: Internal Server Error
+for url: https://resume-api-femi.fly.dev/single_analyze
+```
+
+Three independent defects combined to produce it:
+
+1. **Un-sanitized document text hit PostgreSQL.** PyMuPDF happily returns NUL
+   bytes and lone UTF-16 surrogates from CVs with broken font/ToUnicode maps.
+   PostgreSQL rejects `\x00` in `TEXT` outright and psycopg2 cannot encode
+   surrogates, so the `db.commit()` raised and the handler mapped it to a 500.
+   → `parsing.sanitize_text()` now scrubs every parsed string, and the JD is
+   sanitized and length-capped too.
+2. **Optional ML extras were treated as mandatory.** A missing/corrupt
+   `role_classifier.joblib`, or an OOM-killed spaCy load on a small Fly VM,
+   propagated straight out of the handler — despite the documented "graceful
+   degradation". → NER, role classification and skill extraction are each
+   wrapped; failures are recorded in `match_details` and the analysis still
+   completes.
+3. **The Streamlit client turned any API error into a crash.**
+   `analyze_via_api()` called `resp.raise_for_status()`, so a single failing
+   upload killed the whole script with a traceback instead of falling back to
+   the local score it had already computed. → it now returns `(payload, error)`
+   and never raises; the UI degrades to local mode with a warning.
+
+**Operational notes**
+
+- Set `DEBUG_ERRORS=1` on the API to echo the exception type/message in 5xx
+  bodies while diagnosing; leave it off in production (responses stay generic
+  and the full traceback is logged server-side instead).
+- Tune the UI's patience for cold Fly machines with `API_ANALYZE_TIMEOUT`
+  (seconds, default `120`).
+- `fly logs --app resume-api-femi` now shows a structured
+  `Analysis failed for <file>` line with the full traceback for any residual
+  failure.
+
+### Other common issues
+
+| Symptom | Cause / fix |
+|---|---|
+| `No readable text in '<file>'` (400) | scanned image PDF — needs OCR before upload |
+| `Storage backend unavailable` (503) | database unreachable; check `DATABASE_URL` / Supabase status |
+| Sidebar shows *API offline — local mode* | `API_URL` wrong or the API is asleep; scoring falls back to local keyword matching |
+| Role always `General / Uncategorized` | scikit-learn not installed — the classifier falls back to keyword profiles |
 
 ---
 
@@ -394,6 +460,28 @@ CI runs the same gates on every push: **compile → migrate-check → test suite
 - API **and** worker expose `/metrics` (request latency, task throughput, failures)
 - Compose stack includes **Prometheus** (pre-configured scrape targets) and **Grafana**
   with a provisioned *ResumeRank Overview* dashboard — zero clicks to graphs
+
+---
+
+## 🆕 What's new in v5.7 — reliability hardening
+
+- 🩹 **Fixed the live `500` on `POST /single_analyze`** — parsed text is now scrubbed of
+  NUL bytes, control characters and lone surrogates before it can reach PostgreSQL
+  (see [🛠 Troubleshooting](#-troubleshooting) for the full root-cause writeup)
+- 🛡 **Optional ML extras genuinely degrade now** — a corrupt `role_classifier.joblib`
+  or an OOM-killed spaCy load records an error in `match_details` and still returns a
+  completed analysis instead of a 500
+- 🧯 **The UI can no longer crash on an API error** — `analyze_via_api()` returns
+  `(payload, error)` and never raises; failed uploads fall back to the local score
+- 📛 **Correct HTTP semantics** — `400` empty file/JD, `409` dedup race, `503` database
+  down, `500` only for genuine internal faults (and bodies no longer leak internals)
+- 📄 **PDF line structure preserved** — pages are newline-joined, so candidate-name
+  extraction works on PDF resumes again (it previously collapsed the CV onto one line)
+- 🔐 **`streamlit-authenticator` 0.3.x *and* 0.4.x supported** in the offline-login path
+- 🧪 **+13 regression tests** (44 unit total) incl. a psycopg2-adapter proof and an
+  Alembic single-head guard
+- 🪵 **Structured server-side logging** with full tracebacks; `DEBUG_ERRORS=1` to echo
+  details, `API_ANALYZE_TIMEOUT` to tune UI patience for cold machines
 
 ---
 

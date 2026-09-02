@@ -5,10 +5,33 @@ Shared by the Celery worker and the Streamlit local-fallback mode.
 """
 
 import io
-import tempfile
+import re
 import os
 
 SUPPORTED_EXTENSIONS = (".pdf", ".docx")
+
+# PostgreSQL TEXT columns reject NUL (0x00) outright, and psycopg2 cannot
+# encode lone UTF-16 surrogates. Both show up routinely in real-world PDFs
+# (broken CID/ToUnicode maps, embedded form fields, scanner artefacts), so
+# every parsed string is scrubbed before it can reach the database.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def sanitize_text(text: str) -> str:
+    """Make parsed document text safe to persist and to JSON-encode.
+
+    Strips NUL/control characters and lone surrogates, and normalizes
+    whitespace runs. Never raises - a resume must not 500 the API.
+    """
+    if not text:
+        return ""
+    # Drop unpaired surrogates (psycopg2/JSON both choke on them).
+    text = text.encode("utf-8", "ignore").decode("utf-8", "ignore")
+    text = _CONTROL_RE.sub(" ", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t\u00a0]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def parse_resume(filename: str, payload: bytes) -> str:
@@ -19,9 +42,9 @@ def parse_resume(filename: str, payload: bytes) -> str:
     ext = os.path.splitext(filename or "")[1].lower()
 
     if ext == ".pdf":
-        return _parse_pdf(payload)
+        return sanitize_text(_parse_pdf(payload))
     if ext == ".docx":
-        return _parse_docx(payload)
+        return sanitize_text(_parse_docx(payload))
     raise ValueError(
         f"Unsupported file type '{ext or 'unknown'}'. "
         f"Supported: {', '.join(SUPPORTED_EXTENSIONS)}"
@@ -35,7 +58,10 @@ def _parse_pdf(payload: bytes) -> str:
         import fitz              # legacy shim (deprecation-warns on 1.28)
     doc = fitz.open(stream=payload, filetype="pdf")
     try:
-        return " ".join(page.get_text() for page in doc)
+        # Newline-joined: extract_name() and the education heuristics are
+        # line-oriented, and " ".join() used to collapse the whole CV onto a
+        # single line, which broke name extraction for every PDF resume.
+        return "\n".join(page.get_text() for page in doc)
     finally:
         doc.close()
 

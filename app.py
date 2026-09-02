@@ -46,6 +46,20 @@ st.set_page_config(
 )
 
 API_URL = os.environ.get("API_URL", "http://localhost:8000").rstrip("/")
+# Cold Fly.io machines + spaCy/sklearn imports can take a while on first hit.
+API_ANALYZE_TIMEOUT = int(os.environ.get("API_ANALYZE_TIMEOUT", "120"))
+
+
+def _api_error_detail(resp) -> str:
+    """Best-effort human-readable detail out of a FastAPI error response."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return (resp.text or "").strip()[:200] or "no response body"
+    detail = body.get("detail") if isinstance(body, dict) else body
+    if isinstance(detail, list):        # pydantic validation errors
+        detail = "; ".join(str(d.get("msg", d)) for d in detail)
+    return str(detail)[:200]
 POLL_INTERVAL_S = 2
 POLL_TIMEOUT_S = 120
 
@@ -722,24 +736,62 @@ if USING_API and not st.session_state.token:
 # ---------------- LEGACY LOGIN (API offline) ----------------
 if not USING_API:
     import streamlit_authenticator as stauth
-    from streamlit_authenticator.utilities.hasher import Hasher
 
     names = ["HR Manager", "Recruiter"]
     usernames = [os.environ.get("HR_USERNAME", "hr"),
                  os.environ.get("RECRUITER_USERNAME", "recruiter")]
     passwords = [os.environ.get("HR_PASSWORD", "password123"),
                  os.environ.get("RECRUITER_PASSWORD", "securepass")]
-    hashed = Hasher(passwords).generate()
-    # streamlit-authenticator 0.3.x API: credentials dict + 4-arg constructor.
+
+    def _hash_passwords(plain):
+        """streamlit-authenticator moved Hasher between releases:
+          0.3.x -> Hasher(list).generate()
+          0.4.x -> Hasher.hash_list(list)  (Hasher() takes no args)
+        Support both, and fall back to bcrypt directly if neither exists."""
+        try:
+            from streamlit_authenticator.utilities.hasher import Hasher
+        except ImportError:                       # pragma: no cover
+            Hasher = getattr(stauth, "Hasher", None)
+        if Hasher is not None:
+            if hasattr(Hasher, "hash_list"):
+                return Hasher.hash_list(plain)
+            try:
+                return Hasher(plain).generate()
+            except TypeError:                     # pragma: no cover
+                if hasattr(Hasher, "hash"):
+                    return [Hasher.hash(p) for p in plain]
+        import bcrypt                             # pragma: no cover
+        return [bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
+                for p in plain]
+
+    hashed = _hash_passwords(passwords)
     credentials = {"usernames": {
-        u: {"name": n, "password": p}
+        u: {"name": n, "email": f"{u}@local", "password": p}
         for u, n, p in zip(usernames, names, hashed)
     }}
-    authenticator = stauth.Authenticate(
-        credentials, "resume_dashboard",
-        os.environ.get("COOKIE_KEY", "abcdef"), cookie_expiry_days=30,
-    )
-    name, auth_status, _u = authenticator.login("main")
+    try:
+        authenticator = stauth.Authenticate(
+            credentials, "resume_dashboard",
+            os.environ.get("COOKIE_KEY", "abcdef"), cookie_expiry_days=30,
+        )
+    except TypeError:                             # pragma: no cover - 0.4.x kwargs
+        authenticator = stauth.Authenticate(
+            credentials=credentials,
+            cookie_name="resume_dashboard",
+            cookie_key=os.environ.get("COOKIE_KEY", "abcdef"),
+            cookie_expiry_days=30,
+        )
+
+    # 0.3.x returns a (name, status, username) tuple; 0.4.x returns None and
+    # writes into st.session_state instead.
+    login_result = authenticator.login("main")
+    if login_result:
+        name, auth_status, _u = login_result
+    else:
+        name = st.session_state.get("name")
+        auth_status = st.session_state.get("authentication_status")
+    if auth_status is False:
+        st.error("Incorrect username or password.")
     if not auth_status:
         st.stop()
     st.session_state.username = name
@@ -1200,21 +1252,40 @@ def extract_text(file) -> str:
 
 
 def analyze_via_api(file, jd: str):
-    """Submit to FastAPI -> Synchronous direct processing, returns completed result instantly."""
+    """Submit to FastAPI -> synchronous processing, returns (payload, error).
+
+    Contract: this NEVER raises. The caller already computed a local score as
+    a fallback, so any API problem (HTTP error, timeout, DNS failure, bad
+    JSON) must come back as an error string and let the UI degrade to local
+    mode instead of tearing down the whole Streamlit script with a traceback.
+    """
     file.seek(0)
     raw = file.read()
     ext = os.path.splitext(file.name)[1].lower()
     mime = _MIME.get(ext, "application/octet-stream")
 
-    resp = requests.post(
-        f"{API_URL}/single_analyze",
-        files={"resume": (file.name, raw, mime)},
-        data={"jd": jd},
-        headers=api_headers(),
-        timeout=60,
-    )
-    resp.raise_for_status()
-    payload = resp.json()
+    try:
+        resp = requests.post(
+            f"{API_URL}/single_analyze",
+            files={"resume": (file.name, raw, mime)},
+            data={"jd": jd},
+            headers=api_headers(),
+            timeout=API_ANALYZE_TIMEOUT,
+        )
+    except requests.exceptions.Timeout:
+        return None, f"timed out after {API_ANALYZE_TIMEOUT}s"
+    except requests.exceptions.RequestException as exc:
+        return None, f"could not reach the API ({type(exc).__name__})"
+
+    if not resp.ok:
+        return None, f"HTTP {resp.status_code}: {_api_error_detail(resp)}"
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None, "API returned a non-JSON response"
+    if not isinstance(payload, dict) or "jd_match_score" not in payload:
+        return None, "API returned an unexpected payload"
     return payload, None
 
 
@@ -1226,13 +1297,24 @@ if run_clicked and ready:
             st.write(f"🔎 `{resume.name}` — parsing, scoring, classifying…")
             try:
                 resume_text = extract_text(resume)
-            except ValueError as exc:
-                st.error(f"{resume.name}: {exc}")
+            except Exception as exc:
+                # Corrupt/encrypted/scanned files are skipped with a clear
+                # message — one bad upload must not kill the whole batch.
+                st.error(f"{resume.name}: could not read this file ({exc}).")
                 continue
 
-            score, overlap = overlap_score(resume_text, job_desc)
-            fields = extract_fields(resume_text)
-            role = classify_role(resume_text)
+            if not resume_text.strip():
+                st.error(f"{resume.name}: no readable text found — "
+                         "scanned image PDFs need OCR before upload.")
+                continue
+
+            try:
+                score, overlap = overlap_score(resume_text, job_desc)
+                fields = extract_fields(resume_text)
+                role = classify_role(resume_text)
+            except Exception as exc:
+                st.error(f"{resume.name}: local analysis failed ({exc}).")
+                continue
             source = "local"
             duplicate = False
 
