@@ -35,4 +35,14 @@ primary_region = "jnb"   # Johannesburg — nearest Fly region to Lagos
     timeout = "5s"
     grace_period = "120s"       # ML imports are slow on first boot — don't kill it early
     method = "GET"
+    # LIVENESS only, and intentionally so: a failing http_check makes Fly
+    # restart/depool the machine. If this probed the database, a brief
+    # Supabase blip would restart-loop the API and turn a 30s storage hiccup
+    # into a full outage.
+    #
+    # /health/ready DOES check the database and answers 503 when it is
+    # unusable. Point an EXTERNAL uptime monitor (Better Stack, UptimeRobot,
+    # Fly's own alerting) at https://resume-api-femi.fly.dev/health/ready --
+    # during the jobstatus incident /health answered "ok" every 15 seconds
+    # while every write failed, so nothing ever alerted.
     path = "/health"

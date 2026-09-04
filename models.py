@@ -97,6 +97,15 @@ class ResumeResult(Base):
         default=JobStatus.QUEUED,
     )
 
-    # Timestamps
-    created_at = Column(DateTime, default=_utcnow)
-    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+    # Timestamps.
+    #
+    # nullable=False mirrors the migration, which created both columns NOT
+    # NULL with a server_default. The model previously said nullable=True --
+    # harmless while the Python-side default always fires, but any code path
+    # that set one of these to None explicitly would fail with an
+    # IntegrityError that no SQLite test could reproduce (same blind spot as
+    # the jobstatus enum). Keep model and schema in lockstep.
+    created_at = Column(DateTime, nullable=False, default=_utcnow,
+                        server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, default=_utcnow,
+                        onupdate=_utcnow, server_default=func.now())
