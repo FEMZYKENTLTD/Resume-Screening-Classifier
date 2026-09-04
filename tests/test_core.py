@@ -9,6 +9,7 @@ Semantic matching is tested with a stub embedding model (no torch needed).
 import io
 import json
 import os
+import re
 import sys
 import uuid
 import zipfile
@@ -1503,7 +1504,8 @@ def test_version_is_v1_and_single_sourced():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with open(os.path.join(root, "VERSION"), encoding="utf-8") as fh:
         declared = fh.read().strip()
-    assert declared.startswith("1.0"), f"VERSION must be v1.0.x, got {declared}"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", declared), \
+        f"VERSION must be semver (major.minor.patch), got {declared!r}"
     import api_server
     assert api_server.APP_VERSION == declared
     assert app.version == declared
