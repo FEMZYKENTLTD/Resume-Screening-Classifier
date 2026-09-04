@@ -39,7 +39,7 @@ Prometheus/Grafana observability — all deployable with one command.
 
 > 📹 **2–3 minute walkthrough:** *[link to be added — recorded live on the running app]*
 >
-> The video covers: sign-up → paste a Job Description → batch-screen real resumes →
+> The video covers: sign-up → paste a Job Description → screen real resumes →
 > animated score ring & rankings → extracted fields (NER) → My History export →
 > Admin dashboard → a peek at the Celery worker processing jobs live.
 
