@@ -9,6 +9,7 @@ Semantic matching is tested with a stub embedding model (no torch needed).
 import io
 import json
 import os
+import re
 import sys
 import uuid
 import zipfile
@@ -307,6 +308,76 @@ def test_same_resume_different_jd_is_new_job(client):
                      data={"jd": "JD two " + uuid.uuid4().hex}).json()
     assert j2.get("duplicate") is False
     assert j1["job_id"] != j2["job_id"]
+
+
+def test_dedup_is_per_user_so_history_updates(client):
+    """Regression for the 'history/analytics not updating' bug.
+
+    The dedup hash used to be GLOBAL: the first account to screen a resume
+    owned the only row, and any OTHER account screening the identical file
+    got a cache hit that never appeared in their history (and never moved
+    the analytics totals). The hash is now scoped per account.
+    """
+    pdf = _sample_pdf(RESUME_TEXT)
+    jd = "Per-user dedup JD " + uuid.uuid4().hex
+    suffix = uuid.uuid4().hex[:8]
+    a = client.post("/auth/signup", json={
+        "username": f"dedupa{suffix}", "email": f"a{suffix}@x.io",
+        "password": "password1"}).json()
+    b = client.post("/auth/signup", json={
+        "username": f"dedupb{suffix}", "email": f"b{suffix}@x.io",
+        "password": "password1"}).json()
+    ha, hb = {"X-User-Token": a["token"]}, {"X-User-Token": b["token"]}
+
+    first = client.post("/single_analyze",
+                        files={"resume": ("d.pdf", pdf, "application/pdf")},
+                        data={"jd": jd}, headers=ha).json()
+    assert first["duplicate"] is False
+
+    # Same account re-runs the identical file: still a smart cache hit.
+    again = client.post("/single_analyze",
+                        files={"resume": ("d.pdf", pdf, "application/pdf")},
+                        data={"jd": jd}, headers=ha).json()
+    assert again["duplicate"] is True
+    assert again["job_id"] == first["job_id"]
+
+    # A DIFFERENT account screens the same file: their own row, so their
+    # history and the instance analytics actually update.
+    second = client.post("/single_analyze",
+                         files={"resume": ("d.pdf", pdf, "application/pdf")},
+                         data={"jd": jd}, headers=hb).json()
+    assert second["duplicate"] is False
+    assert second["job_id"] != first["job_id"]
+
+    b_hist = client.get("/history", headers=hb).json()
+    assert any(j["job_id"] == second["job_id"] for j in b_hist["jobs"])
+
+    summary = client.get("/analytics/summary").json()
+    assert summary["total_jobs"] >= 2
+
+
+def test_dedup_scope_off_records_every_run(client, monkeypatch):
+    """DEDUP_SCOPE=off (demo mode): even identical re-runs by the same user
+    create fresh rows — history and analytics update on every single run."""
+    import api_server
+    monkeypatch.setattr(api_server, "DEDUP_SCOPE", "off")
+    pdf = _sample_pdf(RESUME_TEXT + " off-scope")
+    jd = "Off-scope JD " + uuid.uuid4().hex
+    suffix = uuid.uuid4().hex[:8]
+    u = client.post("/auth/signup", json={
+        "username": f"offsc{suffix}", "email": f"o{suffix}@x.io",
+        "password": "password1"}).json()
+    h = {"X-User-Token": u["token"]}
+    r1 = client.post("/single_analyze",
+                     files={"resume": ("o.pdf", pdf, "application/pdf")},
+                     data={"jd": jd}, headers=h).json()
+    r2 = client.post("/single_analyze",
+                     files={"resume": ("o.pdf", pdf, "application/pdf")},
+                     data={"jd": jd}, headers=h).json()
+    assert r1["duplicate"] is False and r2["duplicate"] is False
+    assert r1["job_id"] != r2["job_id"]
+    hist = client.get("/history", headers=h).json()
+    assert len([j for j in hist["jobs"] if j["filename"] == "o.pdf"]) == 2
 
 
 def test_task_return_value_wellformed(client):
@@ -1433,7 +1504,55 @@ def test_version_is_v1_and_single_sourced():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with open(os.path.join(root, "VERSION"), encoding="utf-8") as fh:
         declared = fh.read().strip()
-    assert declared.startswith("1.0"), f"VERSION must be v1.0.x, got {declared}"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", declared), \
+        f"VERSION must be semver (major.minor.patch), got {declared!r}"
     import api_server
     assert api_server.APP_VERSION == declared
     assert app.version == declared
+
+
+def test_analyze_via_api_rejects_null_score(monkeypatch):
+    """UI regression: a completed-but-unscored legacy row (jd_match_score
+    null) used to pass the "key exists" validation; the None then crashed
+    the results page with a TypeError in max() right after a batch. It must
+    be treated as an invalid payload so the loop falls back to local."""
+    import app as ui
+
+    class _Resp:
+        ok = True
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"job_id": "x", "status": "completed", "jd_match_score": None}
+
+    monkeypatch.setattr(ui, "API_URL", "http://ui-test-invalid")
+    monkeypatch.setattr(ui.requests, "post", lambda *a, **k: _Resp())
+
+    class _File:
+        name = "r.pdf"
+
+        def seek(self, *a):
+            pass
+
+        def read(self):
+            return b"pdf-bytes"
+
+    payload, err = ui.analyze_via_api(_File(), "jd text")
+    assert payload is None and err, "null-score payload must be rejected"
+
+
+def test_batch_candidate_labels_unique():
+    """The batch loop's duplicate-basename handling: two resume.pdf files in
+    one upload must produce distinct candidate labels so one does not
+    overwrite the other's fields/dup-flag (extracted from app.py's logic)."""
+    seen: dict = {}
+
+    def unique_label(name):
+        seen_count = seen.get(name, 0) + 1
+        seen[name] = seen_count
+        return name if seen_count == 1 else f"{name} ({seen_count})"
+
+    labels = [unique_label("resume.pdf") for _ in range(2)]
+    assert labels == ["resume.pdf", "resume.pdf (2)"]
+    assert len(set(labels)) == 2

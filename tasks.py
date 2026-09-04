@@ -46,9 +46,20 @@ SEMANTIC_WEIGHT = 0.65
 KEYWORD_WEIGHT = 0.35
 
 
-def make_dedup_hash(payload: bytes, jd: str) -> str:
-    """Same resume content + same JD => same analysis => deduplicate."""
-    return hashlib.sha256(payload + b"\x00" + jd.encode("utf-8")).hexdigest()
+def make_dedup_hash(payload: bytes, jd: str, scope: str = "") -> str:
+    """Same resume content + same JD (+ same dedup scope) => same analysis.
+
+    ``scope`` separates dedup namespaces. The API passes the analyst's
+    user id (see DEDUP_SCOPE in api_server.py) so the SAME resume+JD
+    analyzed by TWO different accounts still creates a row for EACH of
+    them — a global hash made the second user's run a "cache hit" that
+    never appeared in their history (the "history is not updating" bug).
+    The Celery worker keeps the legacy global behaviour with the default.
+    """
+    material = payload + b"\x00" + jd.encode("utf-8")
+    if scope:
+        material += b"\x00" + str(scope).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
 
 
 @celery_app.task(name="tasks.analyze_resume_task")
