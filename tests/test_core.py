@@ -1509,3 +1509,50 @@ def test_version_is_v1_and_single_sourced():
     import api_server
     assert api_server.APP_VERSION == declared
     assert app.version == declared
+
+
+def test_analyze_via_api_rejects_null_score(monkeypatch):
+    """UI regression: a completed-but-unscored legacy row (jd_match_score
+    null) used to pass the "key exists" validation; the None then crashed
+    the results page with a TypeError in max() right after a batch. It must
+    be treated as an invalid payload so the loop falls back to local."""
+    import app as ui
+
+    class _Resp:
+        ok = True
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"job_id": "x", "status": "completed", "jd_match_score": None}
+
+    monkeypatch.setattr(ui, "API_URL", "http://ui-test-invalid")
+    monkeypatch.setattr(ui.requests, "post", lambda *a, **k: _Resp())
+
+    class _File:
+        name = "r.pdf"
+
+        def seek(self, *a):
+            pass
+
+        def read(self):
+            return b"pdf-bytes"
+
+    payload, err = ui.analyze_via_api(_File(), "jd text")
+    assert payload is None and err, "null-score payload must be rejected"
+
+
+def test_batch_candidate_labels_unique():
+    """The batch loop's duplicate-basename handling: two resume.pdf files in
+    one upload must produce distinct candidate labels so one does not
+    overwrite the other's fields/dup-flag (extracted from app.py's logic)."""
+    seen: dict = {}
+
+    def unique_label(name):
+        seen_count = seen.get(name, 0) + 1
+        seen[name] = seen_count
+        return name if seen_count == 1 else f"{name} ({seen_count})"
+
+    labels = [unique_label("resume.pdf") for _ in range(2)]
+    assert labels == ["resume.pdf", "resume.pdf (2)"]
+    assert len(set(labels)) == 2

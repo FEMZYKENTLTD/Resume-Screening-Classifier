@@ -1585,7 +1585,13 @@ def analyze_via_api(file, jd: str):
         payload = resp.json()
     except ValueError:
         return None, "API returned a non-JSON response"
-    if not isinstance(payload, dict) or "jd_match_score" not in payload:
+    if not isinstance(payload, dict) or not isinstance(
+        payload.get("jd_match_score"), (int, float)
+    ):
+        # A None score (e.g. a legacy cached row that never got scored) used
+        # to pass the old "key exists" check and later crash the results page
+        # with a TypeError in max() — treat it as an invalid payload and fall
+        # back to the local score instead.
         return None, "API returned an unexpected payload"
     return payload, None
 
@@ -1593,58 +1599,74 @@ def analyze_via_api(file, jd: str):
 if run_clicked and ready:
     results, all_keywords, fields_by_candidate, dup_flags = [], [], {}, {}
     progress = st.progress(0.0)
+    seen_names: dict = {}
+
+    def _unique_label(name: str) -> str:
+        """Two files in one batch can share a basename (resume.pdf from two
+        folders). Keying results/fields by the raw name made the second file
+        silently overwrite the first's extracted fields and dup flag."""
+        seen = seen_names.get(name, 0) + 1
+        seen_names[name] = seen
+        return name if seen == 1 else f"{name} ({seen})"
+
     with st.status("✨ AI pipeline working its magic…", expanded=True) as status_box:
         for i, resume in enumerate(resumes, start=1):
+            label = _unique_label(resume.name)
             st.write(f"🔎 `{resume.name}` — parsing, scoring, classifying…")
-            try:
-                resume_text = extract_text(resume)
-            except Exception as exc:
-                # Corrupt/encrypted/scanned files are skipped with a clear
-                # message — one bad upload must not kill the whole batch.
-                st.error(f"{resume.name}: could not read this file ({exc}).")
-                continue
 
-            if not resume_text.strip():
-                st.error(f"{resume.name}: no readable text found — "
-                         "scanned image PDFs need OCR before upload.")
-                continue
-
-            try:
-                score, overlap = overlap_score(resume_text, job_desc)
-                fields = extract_fields(resume_text)
-                role = classify_role(resume_text)
-            except Exception as exc:
-                st.error(f"{resume.name}: local analysis failed ({exc}).")
-                continue
-            source = "local"
-            duplicate = False
-
+            # API-FIRST: when the backend is up, it does the parsing. The UI
+            # used to require its OWN parse to succeed before even calling
+            # the API, so any file the Streamlit container couldn't read was
+            # dropped from the batch (and every file was parsed twice).
+            payload, err = (None, None)
             if USING_API:
                 payload, err = analyze_via_api(resume, job_desc)
-                if payload is not None:
-                    score = payload["jd_match_score"]
-                    role = payload.get("predicted_role") or role
-                    fields = payload.get("extracted_fields") or fields
-                    duplicate = payload.get("duplicate", False)
-                    source = "api (cached)" if duplicate else "api"
-                else:
-                    st.warning(f"{resume.name}: pipeline unavailable ({err}); used local score.")
+
+            score = role = fields = None
+            overlap = []
+            source, duplicate = "local", False
+
+            if payload is not None:
+                score = float(payload["jd_match_score"])
+                role = payload.get("predicted_role") or "—"
+                fields = payload.get("extracted_fields") or {}
+                duplicate = bool(payload.get("duplicate", False))
+                source = "api (cached)" if duplicate else "api"
+                overlap = (payload.get("match_details") or {}).get("matched_terms") or []
+            else:
+                if USING_API:
+                    st.warning(f"{resume.name}: pipeline unavailable ({err}); "
+                               "trying local analysis.")
+                try:  # local fallback (also the primary path in local mode)
+                    resume_text = extract_text(resume)
+                    if not resume_text.strip():
+                        raise ValueError("no readable text found — scanned "
+                                         "image PDFs need OCR before upload")
+                    score, overlap = overlap_score(resume_text, job_desc)
+                    fields = extract_fields(resume_text)
+                    role = classify_role(resume_text)
+                except Exception as exc:
+                    # Corrupt/encrypted/scanned files are skipped with a clear
+                    # message — one bad upload must not kill the whole batch.
+                    st.error(f"{resume.name}: could not analyze this file ({exc}).")
+                    continue
 
             results.append({
-                "Candidate": resume.name,
+                "Candidate": label,
                 "Score": score,
                 "Role": role,
                 "Matched Keywords": ", ".join(overlap),
                 "Source": source,
             })
-            fields_by_candidate[resume.name] = fields
-            dup_flags[resume.name] = duplicate
+            fields_by_candidate[label] = fields
+            dup_flags[label] = duplicate
             all_keywords.extend(overlap)
             progress.progress(i / len(resumes))
 
         if not results:
             status_box.update(label="❌ No resumes could be analyzed.", state="error")
             st.stop()
+        progress.progress(1.0)
         status_box.update(label="✅ Analysis complete — results ready below!",
                           state="complete", expanded=False)
 

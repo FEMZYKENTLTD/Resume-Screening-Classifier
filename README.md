@@ -636,6 +636,16 @@ one symptom:
    scoped **per account** (`DEDUP_SCOPE=user`), cache hits refresh
    `updated_at` (so Admin's "last active" moves), and `DEDUP_SCOPE=off`
    records every single run if you want that for demos.
+5. **Batch screening could die at the end of the run (or drop files).** The
+   UI loop insisted on parsing every file *locally* before calling the API —
+   one file the Streamlit container couldn't parse was dropped from the
+   batch, and every file was parsed twice (2× slower). Worse, a legacy
+   cached row with a `null` score passed validation and crashed the results
+   page with a `TypeError` in `max()` right after the batch finished. → the
+   loop is **API-first** (local scoring only as fallback), a non-numeric
+   score is rejected as an invalid payload, duplicate basenames in one
+   upload get distinct labels (`resume.pdf (2)`), and the matched-keyword
+   cloud now uses the API's `match_details.matched_terms`.
 
 **Operational notes**
 
