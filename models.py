@@ -79,8 +79,23 @@ class ResumeResult(Base):
     # JSON: full match breakdown (semantic score, skill gaps, ...)
     match_details = Column(Text, nullable=True)
 
-    # Current status of the job
-    status = Column(Enum(JobStatus), default=JobStatus.QUEUED)
+    # Current status of the job.
+    #
+    # PRODUCTION BUG (psycopg2 22P02 "invalid input value for enum jobstatus:
+    # \"COMPLETED\""): migration 20260821 creates the Postgres type with the
+    # LOWERCASE values -- sa.Enum('queued','processing','completed','failed').
+    # A bare Enum(JobStatus) persists the Python member NAMES ('COMPLETED'),
+    # which Postgres rejects, so every status write (and every query filtering
+    # on status) failed in production while SQLite -- which does not enforce
+    # enum labels -- happily accepted them in the test suite.
+    #
+    # values_callable pins the stored/bound representation to the member
+    # VALUES, matching the type that already exists in the database.
+    status = Column(
+        Enum(JobStatus, name="jobstatus",
+             values_callable=lambda enum_cls: [m.value for m in enum_cls]),
+        default=JobStatus.QUEUED,
+    )
 
     # Timestamps
     created_at = Column(DateTime, default=_utcnow)

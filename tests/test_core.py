@@ -1556,3 +1556,134 @@ def test_batch_candidate_labels_unique():
     labels = [unique_label("resume.pdf") for _ in range(2)]
     assert labels == ["resume.pdf", "resume.pdf (2)"]
     assert len(set(labels)) == 2
+
+
+# --------------------------------------------------------------------------
+# Enum persistence contract (production incident: psycopg2 22P02)
+# --------------------------------------------------------------------------
+# Fly logs showed every status write and every status filter failing with
+#   invalid input value for enum jobstatus: "COMPLETED"
+# because migration 20260821 creates the Postgres type with LOWERCASE labels
+# while a bare Enum(JobStatus) persists the Python member NAMES. SQLite does
+# not enforce enum labels, so the whole suite stayed green while production
+# could not save a single analysis. These tests pin the contract on ANY
+# backend by asserting the type's stored labels and the compiled bind value.
+
+def test_jobstatus_column_stores_lowercase_enum_values():
+    """The column must persist member VALUES ('completed'), never member
+    NAMES ('COMPLETED') — the latter is rejected by the Postgres type."""
+    import sqlalchemy as sa
+    from models import JobStatus, ResumeResult
+
+    col = ResumeResult.__table__.columns["status"]
+    assert isinstance(col.type, sa.Enum)
+    assert col.type.name == "jobstatus"
+    assert sorted(col.type.enums) == sorted(m.value for m in JobStatus)
+    assert col.type.enums == ["queued", "processing", "completed", "failed"]
+
+
+def test_jobstatus_matches_migration_enum_labels():
+    """Model and migration must not drift: the labels the model writes are
+    exactly the labels CREATE TYPE jobstatus declared."""
+    import sqlalchemy as sa
+    from models import ResumeResult
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, "migrations", "versions",
+                        "20260821_create_resume_results.py")
+    with open(path, encoding="utf-8") as fh:
+        source = fh.read()
+    declared = re.search(r"sa\.Enum\((.*?),\s*name='jobstatus'\)", source, re.S)
+    assert declared, "migration no longer declares the jobstatus enum"
+    migration_labels = re.findall(r"'([a-z]+)'", declared.group(1))
+
+    col = ResumeResult.__table__.columns["status"]
+    assert isinstance(col.type, sa.Enum)
+    assert col.type.enums == migration_labels
+
+
+def test_jobstatus_binds_lowercase_on_postgres_dialect():
+    """The value handed to the Postgres driver must be the lowercase label.
+
+    This is what actually blew up in production: SQLAlchemy keeps the Python
+    member in the compiled params and converts it in the type's bind
+    processor, so the processor's output is the string psycopg2 sends.
+    """
+    from sqlalchemy.dialects import postgresql
+    from models import JobStatus, ResumeResult
+
+    col = ResumeResult.__table__.columns["status"]
+    process = col.type.bind_processor(postgresql.dialect())
+    for member in JobStatus:
+        assert process(member) == member.value
+    assert process(JobStatus.COMPLETED) == "completed"
+    assert process(JobStatus.PROCESSING) == "processing"
+
+    # and the result processor maps the DB label back to the Python member
+    unprocess = col.type.result_processor(postgresql.dialect(), None)
+    assert unprocess("completed") is JobStatus.COMPLETED
+
+
+# --------------------------------------------------------------------------
+# api_fetch_json error contract (production: Analytics page KeyError)
+# --------------------------------------------------------------------------
+
+def _fake_response(status, payload=None, text=None):
+    class _R:
+        status_code = status
+        ok = 200 <= status < 300
+
+        def __init__(self):
+            self.text = text if text is not None else json.dumps(payload or {})
+
+        def json(self):
+            if payload is None:
+                raise ValueError("no json")
+            return payload
+    return _R()
+
+
+def test_api_fetch_json_returns_none_data_on_error_status(monkeypatch):
+    """A 503 from /analytics/summary decodes as {"detail": ...} — valid JSON.
+    Returning it as `data` slipped past every `if data is None:` guard and
+    the page then died on data["total_jobs"]. Error statuses must yield
+    data=None plus a human-readable error."""
+    import app as ui
+
+    resp = _fake_response(
+        503, {"detail": "Analytics is temporarily unavailable (storage). "
+                        "Retry in a moment."})
+    monkeypatch.setattr(ui, "API_URL", "http://ui-test")
+    monkeypatch.setattr(ui.requests, "get", lambda *a, **k: resp)
+
+    r, data, err = ui.api_fetch_json("/analytics/summary")
+    assert data is None, "error bodies must never be handed back as payload"
+    assert r is not None and r.status_code == 503, "caller still needs the status"
+    assert err and "503" in err
+    assert "temporarily unavailable" in err, "detail must reach the retry panel"
+
+
+def test_api_fetch_json_passes_through_success(monkeypatch):
+    """The happy path is unchanged: 200 -> decoded payload, no error."""
+    import app as ui
+
+    resp = _fake_response(200, {"total_jobs": 7, "by_status": {"completed": 7}})
+    monkeypatch.setattr(ui, "API_URL", "http://ui-test")
+    monkeypatch.setattr(ui.requests, "get", lambda *a, **k: resp)
+
+    r, data, err = ui.api_fetch_json("/analytics/summary")
+    assert err is None
+    assert data["total_jobs"] == 7
+
+
+def test_api_fetch_json_auth_statuses_still_expose_status_code(monkeypatch):
+    """Admin/History branch on resp.status_code for 401/403 (expired session,
+    non-admin). Suppressing the body must not suppress the response."""
+    import app as ui
+
+    for code in (401, 403):
+        resp = _fake_response(code, {"detail": "nope"})
+        monkeypatch.setattr(ui, "API_URL", "http://ui-test")
+        monkeypatch.setattr(ui.requests, "get", lambda *a, **k: resp)
+        r, data, err = ui.api_fetch_json("/admin/overview")
+        assert r.status_code == code and data is None and err
