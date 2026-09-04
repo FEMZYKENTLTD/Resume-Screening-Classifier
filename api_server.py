@@ -29,7 +29,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadF
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func
+from sqlalchemy import func, text as sa_text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import load_only
 
@@ -165,7 +165,44 @@ def startup_event():
 
 @app.get("/health")
 def health():
+    """Liveness: the process is up and serving.
+
+    Deliberately does NOT touch the database. Fly's http_check hits this every
+    15s and restarts/depools the machine when it fails, so making it depend on
+    Postgres would turn a brief storage blip into a restart loop that takes
+    the whole API down. Use /health/ready for dependency status.
+
+    The body is kept EXACTLY {"status": "ok"} -- external uptime monitors and
+    the compose healthchecks match on it.
+    """
     return {"status": "ok"}
+
+
+@app.get("/health/ready")
+def health_ready(response: Response):
+    """Readiness: can this instance actually serve requests end to end?
+
+    During the jobstatus outage /health answered "ok" every 15 seconds while
+    every write was failing, so nothing anywhere flagged the incident -- the
+    logs looked healthy and the breakage was only visible to users. This probe
+    verifies the dependency the API is useless without, so an uptime monitor
+    pointed here surfaces a storage problem instead of hiding it.
+    """
+    db = SessionLocal()
+    try:
+        db.execute(sa_text("SELECT 1"))
+        return {"status": "ready", "database": "ok", "version": APP_VERSION}
+    except SQLAlchemyError as exc:
+        logger.error("readiness probe failed: %s", exc)
+        response.status_code = 503
+        return {
+            "status": "degraded",
+            "database": "unavailable",
+            "version": APP_VERSION,
+            "detail": type(exc).__name__,
+        }
+    finally:
+        db.close()
 
 
 @app.get("/metrics")

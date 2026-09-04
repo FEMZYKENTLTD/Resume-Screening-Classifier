@@ -643,6 +643,14 @@ def api_fetch_json(path: str, params=None, timeout: float = 15,
     data is the decoded dict or None, and error is a human-readable string
     or None. This NEVER raises for transport/decoding problems — a degraded
     API shows a retry message instead of killing the page with a traceback.
+
+    CONTRACT: data is non-None ONLY for a successful (2xx) response. An error
+    status carries a FastAPI error body -- {"detail": "..."} -- which decodes
+    perfectly well as JSON, so returning it as `data` made every caller's
+    `if data is None:` guard pass straight through to `data["total_jobs"]`
+    and crash the page with a KeyError (production: the Analytics page after
+    /analytics/summary started returning 503). Callers that need the status
+    code still get the full response object.
     """
     try:
         resp = requests.get(
@@ -661,7 +669,9 @@ def api_fetch_json(path: str, params=None, timeout: float = 15,
         return resp, None, (f"API error HTTP {resp.status_code}: "
                             f"{_api_error_detail(resp)}")
     if not resp.ok:
-        return resp, data, (f"API error HTTP {resp.status_code}: "
+        # data is an error envelope, NOT the payload the caller expects —
+        # hand back None so the `data is None` guards actually fire.
+        return resp, None, (f"API error HTTP {resp.status_code}: "
                             f"{_api_error_detail(resp)}")
     return resp, data, None
 

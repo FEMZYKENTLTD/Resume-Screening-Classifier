@@ -1556,3 +1556,259 @@ def test_batch_candidate_labels_unique():
     labels = [unique_label("resume.pdf") for _ in range(2)]
     assert labels == ["resume.pdf", "resume.pdf (2)"]
     assert len(set(labels)) == 2
+
+
+# --------------------------------------------------------------------------
+# Enum persistence contract (production incident: psycopg2 22P02)
+# --------------------------------------------------------------------------
+# Fly logs showed every status write and every status filter failing with
+#   invalid input value for enum jobstatus: "COMPLETED"
+# because migration 20260821 creates the Postgres type with LOWERCASE labels
+# while a bare Enum(JobStatus) persists the Python member NAMES. SQLite does
+# not enforce enum labels, so the whole suite stayed green while production
+# could not save a single analysis. These tests pin the contract on ANY
+# backend by asserting the type's stored labels and the compiled bind value.
+
+def test_jobstatus_column_stores_lowercase_enum_values():
+    """The column must persist member VALUES ('completed'), never member
+    NAMES ('COMPLETED') — the latter is rejected by the Postgres type."""
+    import sqlalchemy as sa
+    from models import JobStatus, ResumeResult
+
+    col = ResumeResult.__table__.columns["status"]
+    assert isinstance(col.type, sa.Enum)
+    assert col.type.name == "jobstatus"
+    assert sorted(col.type.enums) == sorted(m.value for m in JobStatus)
+    assert col.type.enums == ["queued", "processing", "completed", "failed"]
+
+
+def test_jobstatus_matches_migration_enum_labels():
+    """Model and migration must not drift: the labels the model writes are
+    exactly the labels CREATE TYPE jobstatus declared."""
+    import sqlalchemy as sa
+    from models import ResumeResult
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, "migrations", "versions",
+                        "20260821_create_resume_results.py")
+    with open(path, encoding="utf-8") as fh:
+        source = fh.read()
+    declared = re.search(r"sa\.Enum\((.*?),\s*name='jobstatus'\)", source, re.S)
+    assert declared, "migration no longer declares the jobstatus enum"
+    migration_labels = re.findall(r"'([a-z]+)'", declared.group(1))
+
+    col = ResumeResult.__table__.columns["status"]
+    assert isinstance(col.type, sa.Enum)
+    assert col.type.enums == migration_labels
+
+
+def test_jobstatus_binds_lowercase_on_postgres_dialect():
+    """The value handed to the Postgres driver must be the lowercase label.
+
+    This is what actually blew up in production: SQLAlchemy keeps the Python
+    member in the compiled params and converts it in the type's bind
+    processor, so the processor's output is the string psycopg2 sends.
+    """
+    from sqlalchemy.dialects import postgresql
+    from models import JobStatus, ResumeResult
+
+    col = ResumeResult.__table__.columns["status"]
+    process = col.type.bind_processor(postgresql.dialect())
+    for member in JobStatus:
+        assert process(member) == member.value
+    assert process(JobStatus.COMPLETED) == "completed"
+    assert process(JobStatus.PROCESSING) == "processing"
+
+    # and the result processor maps the DB label back to the Python member
+    unprocess = col.type.result_processor(postgresql.dialect(), None)
+    assert unprocess("completed") is JobStatus.COMPLETED
+
+
+# --------------------------------------------------------------------------
+# api_fetch_json error contract (production: Analytics page KeyError)
+# --------------------------------------------------------------------------
+
+def _fake_response(status, payload=None, text=None):
+    class _R:
+        status_code = status
+        ok = 200 <= status < 300
+
+        def __init__(self):
+            self.text = text if text is not None else json.dumps(payload or {})
+
+        def json(self):
+            if payload is None:
+                raise ValueError("no json")
+            return payload
+    return _R()
+
+
+def test_api_fetch_json_returns_none_data_on_error_status(monkeypatch):
+    """A 503 from /analytics/summary decodes as {"detail": ...} — valid JSON.
+    Returning it as `data` slipped past every `if data is None:` guard and
+    the page then died on data["total_jobs"]. Error statuses must yield
+    data=None plus a human-readable error."""
+    import app as ui
+
+    resp = _fake_response(
+        503, {"detail": "Analytics is temporarily unavailable (storage). "
+                        "Retry in a moment."})
+    monkeypatch.setattr(ui, "API_URL", "http://ui-test")
+    monkeypatch.setattr(ui.requests, "get", lambda *a, **k: resp)
+
+    r, data, err = ui.api_fetch_json("/analytics/summary")
+    assert data is None, "error bodies must never be handed back as payload"
+    assert r is not None and r.status_code == 503, "caller still needs the status"
+    assert err and "503" in err
+    assert "temporarily unavailable" in err, "detail must reach the retry panel"
+
+
+def test_api_fetch_json_passes_through_success(monkeypatch):
+    """The happy path is unchanged: 200 -> decoded payload, no error."""
+    import app as ui
+
+    resp = _fake_response(200, {"total_jobs": 7, "by_status": {"completed": 7}})
+    monkeypatch.setattr(ui, "API_URL", "http://ui-test")
+    monkeypatch.setattr(ui.requests, "get", lambda *a, **k: resp)
+
+    r, data, err = ui.api_fetch_json("/analytics/summary")
+    assert err is None
+    assert data["total_jobs"] == 7
+
+
+def test_api_fetch_json_auth_statuses_still_expose_status_code(monkeypatch):
+    """Admin/History branch on resp.status_code for 401/403 (expired session,
+    non-admin). Suppressing the body must not suppress the response."""
+    import app as ui
+
+    for code in (401, 403):
+        resp = _fake_response(code, {"detail": "nope"})
+        monkeypatch.setattr(ui, "API_URL", "http://ui-test")
+        monkeypatch.setattr(ui.requests, "get", lambda *a, **k: resp)
+        r, data, err = ui.api_fetch_json("/admin/overview")
+        assert r.status_code == code and data is None and err
+
+
+# --------------------------------------------------------------------------
+# Model <-> migration drift guards
+# --------------------------------------------------------------------------
+# The jobstatus outage was drift the test suite could not see. These checks
+# compare the ORM against the migration DDL as SOURCE TEXT, so they work on
+# SQLite (and in CI) without needing a live Postgres.
+
+def test_resume_results_timestamps_match_migration_nullability():
+    """Migration 20260821 creates created_at/updated_at NOT NULL. A model that
+    says nullable=True hides an IntegrityError that only Postgres raises."""
+    from models import ResumeResult
+
+    for name in ("created_at", "updated_at"):
+        col = ResumeResult.__table__.columns[name]
+        assert col.nullable is False, (
+            f"{name}: model allows NULL but the migration created it NOT NULL")
+        assert col.server_default is not None, (
+            f"{name}: migration sets a server_default; the model must too, or "
+            "raw INSERTs that skip the ORM default will fail")
+
+
+def test_no_model_column_is_missing_from_migrations():
+    """Every column the ORM selects must exist in the migration DDL.
+
+    A model-only column makes EVERY query against that table fail on Postgres
+    with UndefinedColumn while SQLite tests (which build the schema from the
+    models themselves) stay green.
+    """
+    from models import ResumeResult, User
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    versions = os.path.join(root, "migrations", "versions")
+    ddl = ""
+    for fname in sorted(os.listdir(versions)):
+        if fname.endswith(".py"):
+            with open(os.path.join(versions, fname), encoding="utf-8") as fh:
+                ddl += fh.read()
+
+    for model in (ResumeResult, User):
+        for col in model.__table__.columns:
+            assert f"'{col.name}'" in ddl or f'"{col.name}"' in ddl, (
+                f"{model.__tablename__}.{col.name} exists in the model but no "
+                f"migration ever creates it -> UndefinedColumn on Postgres")
+
+
+# --------------------------------------------------------------------------
+# Fail-safe auth secret + honest readiness probe
+# --------------------------------------------------------------------------
+
+def test_auth_rejects_tokens_forged_with_the_published_default_secret():
+    """auth.py used to fall back to a hard-coded secret that is published in
+    this repo. Any deployment missing AUTH_SECRET_KEY could be impersonated by
+    signing a token with that known value -- silently, forever. The fallback
+    must now be random per process, so such a token cannot verify."""
+    import importlib
+    from itsdangerous import URLSafeTimedSerializer
+
+    forged = URLSafeTimedSerializer(
+        "dev-insecure-secret-change-me", salt="resume-auth-v1"
+    ).dumps({"uid": 1, "tv": 0})
+
+    saved = os.environ.get("AUTH_SECRET_KEY")
+    try:
+        os.environ.pop("AUTH_SECRET_KEY", None)
+        mod = importlib.reload(importlib.import_module("auth"))
+        assert mod.AUTH_SECRET_IS_EPHEMERAL is True
+        assert mod.verify_token(forged) is None, \
+            "token forged with the published default secret must NOT verify"
+        # a token this process minted still works
+        assert mod.verify_token(mod.create_token(7, 0)) == 7
+    finally:
+        if saved is not None:
+            os.environ["AUTH_SECRET_KEY"] = saved
+        else:
+            os.environ["AUTH_SECRET_KEY"] = "test-secret-not-for-production"
+        importlib.reload(importlib.import_module("auth"))
+
+
+def test_configured_secret_is_used_verbatim():
+    """A real secret must be honoured (tokens survive restarts)."""
+    import importlib
+
+    saved = os.environ.get("AUTH_SECRET_KEY")
+    try:
+        os.environ["AUTH_SECRET_KEY"] = "a-genuinely-long-random-production-secret"
+        mod = importlib.reload(importlib.import_module("auth"))
+        assert mod.AUTH_SECRET_IS_EPHEMERAL is False
+        assert mod.SECRET_KEY == "a-genuinely-long-random-production-secret"
+    finally:
+        os.environ["AUTH_SECRET_KEY"] = saved or "test-secret-not-for-production"
+        importlib.reload(importlib.import_module("auth"))
+
+
+def test_health_is_liveness_only_and_ready_checks_the_database(client):
+    """/health must stay dependency-free (Fly restarts the machine when it
+    fails), while /health/ready reports real dependency state."""
+    r = client.get("/health")
+    assert r.status_code == 200 and r.json()["status"] == "ok"
+
+    r = client.get("/health/ready")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ready", "database": "ok",
+                        "version": r.json()["version"]}
+
+
+def test_readiness_reports_503_when_the_database_is_unusable(client):
+    """The whole point: during the outage /health said "ok" every 15s while
+    every write failed. A readiness probe must go red instead."""
+    import sqlalchemy as sa
+    import api_server
+
+    real_bind = api_server.SessionLocal.kw["bind"]
+    dead = sa.create_engine("postgresql://nobody:nobody@127.0.0.1:1/none",
+                            connect_args={"connect_timeout": 1})
+    try:
+        api_server.SessionLocal.configure(bind=dead)
+        r = client.get("/health/ready")
+        assert r.status_code == 503, "readiness must fail when storage is down"
+        assert r.json()["database"] == "unavailable"
+        # liveness stays green so the platform does not restart-loop the app
+        assert client.get("/health").status_code == 200
+    finally:
+        api_server.SessionLocal.configure(bind=real_bind)
