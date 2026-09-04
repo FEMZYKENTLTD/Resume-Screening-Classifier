@@ -99,7 +99,7 @@ Streamlit UI  ──POST /single_analyze──▶  FastAPI  ──▶ parse → 
 |---|---|
 | 🗣 **True NER** | spaCy `en_core_web_sm` → PERSON / ORG extraction, with a **skill-lexicon guard** (stops "Docker" being read as a name 😅) and regex fallback when the model isn't installed |
 | 🧑‍💼 **Trained role classifier** | TF-IDF + logistic regression over **9 role families**, trained on **619 resume-shaped documents** (`training/corpus.py` generator + curated rows). Accepts the ML vote on **confidence *or* margin over the runner-up**. Held-out accuracy **100% over 141 unseen docs**, **4/4** on the real demo PDFs, **6/6** on deliberately ambiguous overlap cases |
-| ♻️ **Smart duplicate detection** | identical resume + identical JD short-circuits to the cached analysis (API check + unique DB index) — watch the "smart cache hit" badge |
+| ♻️ **Smart duplicate detection** | identical resume + identical JD **per account** short-circuits to the cached analysis (API check + unique DB index) — watch the "smart cache hit" badge. Scope is configurable (`DEDUP_SCOPE=user\|global\|off`) |
 | 🛡 **Graceful degradation** | spaCy / sentence-transformers / scikit-learn are **optional extras** — base images stay lean, features fall back cleanly |
 
 ### 👥 Accounts, History & Admin
@@ -316,7 +316,10 @@ API_URL=http://localhost:8000 streamlit run app.py
 | `ADMIN_BOOTSTRAP_FIRST_USER` | `1` | if the instance has **no** admin, promote the oldest (owner) account |
 | `ADMIN_STRICT_SYNC` | `0` | `1` = mirror the lists exactly, demoting anyone not listed (off by default: it used to wipe DB-granted admins) |
 | `ALLOW_LEGACY_LOGIN` | `1` | `0` = never fall back to the env-credential login when the API is down |
-| `API_HEALTH_TIMEOUT` / `API_HEALTH_RETRIES` | `8` / `3` | how patient the UI is with a cold API before declaring it offline |
+| `DEDUP_SCOPE` | `user` | dedup namespace for identical resume+JD: `user` (each account gets its own row), `global` (legacy one-row-instance-wide), `off` (record every run — demo mode) |
+| `DB_CONNECT_TIMEOUT` | `10` | seconds before a DB connection attempt fails (a paused database returns a clean 503 instead of hanging the request) |
+| `DB_POOL_RECYCLE` | `280` | recycle pooled DB connections before the server kills idle ones |
+| `API_HEALTH_TIMEOUT` / `API_HEALTH_RETRIES` | `12` / `3` | how patient the UI is with a cold API before declaring it offline |
 | `API_ANALYZE_TIMEOUT` | `120` | UI timeout for `/single_analyze` |
 | `CORS_ALLOW_ORIGINS` | `*` | lock the API down to your UI origin in production |
 | `ENABLE_SEMANTIC` | `0` | `1` = blend embedding score (needs sentence-transformers) |
@@ -594,6 +597,52 @@ Three independent defects combined to produce it:
 - `fly logs --app resume-api-femi` now shows a structured
   `Analysis failed for <file>` line with the full traceback for any residual
   failure.
+
+### `JSONDecodeError: Expecting value` on the Admin dashboard + "history/analytics not updating" (fixed in v1.1)
+
+The Admin page died with:
+
+```
+requests.exceptions.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+File "app.py", line 1058, in <module>
+    ov = overview.json()
+```
+
+…while 🗂 My History and 📈 Analytics showed stale numbers. Four defects,
+one symptom:
+
+1. **The UI parsed API bodies with no guard.** `overview.json()` /
+   `trends.json()` ran bare, so ANY non-JSON response killed the whole
+   Streamlit script. → every fetch now goes through `api_fetch_json()`,
+   which never raises: a broken backend renders a friendly panel with a
+   **🔄 Retry now** button instead of a traceback. Login, signup and the
+   session-restore paths got the same treatment.
+2. **Hanging DB connections produced those non-JSON bodies.** The engine had
+   no `connect_timeout`, so a paused/unreachable database hung the request
+   until the platform proxy answered `502` with an EMPTY body — which is
+   exactly what `.json()` choked on. → the engine now fails fast
+   (`DB_CONNECT_TIMEOUT`, default 10s) and the read endpoints return a clean
+   JSON `503` ("Retry in a moment").
+3. **The dashboard endpoints loaded the whole table.** `/analytics/summary`,
+   `/admin/overview` and `/admin/trends` hydrated every row *including the
+   `resume_text`/`job_description` TEXT blobs* just to count them — slow
+   enough to trip proxy timeouts on a filled database. → all aggregates are
+   narrow-column SQL now (`COUNT`/`AVG`/`GROUP BY`), and `/history` only
+   selects the columns the page renders.
+4. **History/analytics "not updating" was a dedup attribution bug.** The
+   dedup hash was GLOBAL: the first account to screen a resume+JD owned the
+   only row, and every other account got a silent cache hit that never
+   appeared in their history and never moved the totals. → the hash is
+   scoped **per account** (`DEDUP_SCOPE=user`), cache hits refresh
+   `updated_at` (so Admin's "last active" moves), and `DEDUP_SCOPE=off`
+   records every single run if you want that for demos.
+
+**Operational notes**
+
+- `DEDUP_SCOPE=user|global|off` — see the env table above.
+- Reproduce the fixed crash safely: point `API_URL` at any server that
+  returns an empty `502`; the Admin page now shows the retry panel.
+
 
 ### `en_core_web_sm` fails to install (blocked GitHub CDN)
 

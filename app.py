@@ -50,7 +50,7 @@ API_URL = os.environ.get("API_URL", "http://localhost:8000").rstrip("/")
 API_ANALYZE_TIMEOUT = int(os.environ.get("API_ANALYZE_TIMEOUT", "120"))
 # Health probe: a cold backend can take a few seconds to answer. These control
 # how patient the UI is before it decides the API is down (see api_available).
-API_HEALTH_TIMEOUT = float(os.environ.get("API_HEALTH_TIMEOUT", "8"))
+API_HEALTH_TIMEOUT = float(os.environ.get("API_HEALTH_TIMEOUT", "12"))
 API_HEALTH_RETRIES = int(os.environ.get("API_HEALTH_RETRIES", "3"))
 # Allow the legacy env-credential login when the API is unreachable. Set to 0
 # on a deployment whose accounts all live in the API/database.
@@ -67,8 +67,6 @@ def _api_error_detail(resp) -> str:
     if isinstance(detail, list):        # pydantic validation errors
         detail = "; ".join(str(d.get("msg", d)) for d in detail)
     return str(detail)[:200]
-POLL_INTERVAL_S = 2
-POLL_TIMEOUT_S = 120
 
 CHART_COLORS = ["#6366F1", "#8B5CF6", "#D946EF", "#22D3EE", "#34D399", "#F59E0B"]
 GRADIENTS = [
@@ -622,6 +620,65 @@ def api_headers() -> dict:
     return {"X-User-Token": st.session_state.token} if st.session_state.token else {}
 
 
+def _decode_json_body(resp) -> dict | None:
+    """Decode a JSON object body, or None — never raise.
+
+    When the backend (or a proxy in front of it) returns an empty body or an
+    HTML error page, resp.json() raises JSONDecodeError. The Admin dashboard
+    used to call .json() bare, so exactly that took the whole page down with
+    a traceback. Everything now goes through this guard instead.
+    """
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def api_fetch_json(path: str, params=None, timeout: float = 15,
+                   headers: dict | None = None):
+    """GET {API_URL}{path} and decode defensively.
+
+    Returns (resp, data, error): resp is the requests response or None,
+    data is the decoded dict or None, and error is a human-readable string
+    or None. This NEVER raises for transport/decoding problems — a degraded
+    API shows a retry message instead of killing the page with a traceback.
+    """
+    try:
+        resp = requests.get(
+            f"{API_URL}{path}",
+            params=params,
+            headers=api_headers() if headers is None else headers,
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        return None, None, f"could not reach the API ({type(exc).__name__})"
+    data = _decode_json_body(resp)
+    if data is None:
+        if resp.ok:
+            return resp, None, (f"API returned a non-JSON response "
+                                f"(HTTP {resp.status_code})")
+        return resp, None, (f"API error HTTP {resp.status_code}: "
+                            f"{_api_error_detail(resp)}")
+    if not resp.ok:
+        return resp, data, (f"API error HTTP {resp.status_code}: "
+                            f"{_api_error_detail(resp)}")
+    return resp, data, None
+
+
+def _api_retry_panel(context: str, error: str | None = None) -> None:
+    """Friendly 'the backend did not answer properly' panel + retry button."""
+    msg = f"⚠️ {context} is not responding correctly"
+    if error:
+        msg += f" — {error}"
+    msg += (". The API may be waking up, or the database may be briefly "
+            "unavailable. Your data is safe; retry in a few seconds.")
+    st.error(msg)
+    if st.button("🔄 Retry now", key=f"retry_{context}"):
+        _api_available_cached.clear()
+        st.rerun()
+
+
 def _flash(message: str, icon: str = "✨") -> None:
     st.session_state._flash = (message, icon)
 
@@ -700,9 +757,11 @@ def _do_login(username: str, password: str) -> str | None:
     except requests.RequestException:
         return "API unreachable"
     if resp.ok:
-        data = resp.json()
-        _adopt_session(data)
-        return None
+        data = _decode_json_body(resp)
+        if data and "token" in data:
+            _adopt_session(data)
+            return None
+        return "Login failed — API returned an unexpected response"
     try:
         return resp.json().get("detail", "Login failed")
     except ValueError:
@@ -719,9 +778,11 @@ def _do_signup(username: str, email: str, password: str) -> str | None:
     except requests.RequestException:
         return "API unreachable"
     if resp.ok:
-        data = resp.json()
-        _adopt_session(data)
-        return None
+        data = _decode_json_body(resp)
+        if data and "token" in data:
+            _adopt_session(data)
+            return None
+        return "Signup failed — API returned an unexpected response"
     try:
         return resp.json().get("detail", str(resp.json()))
     except ValueError:
@@ -745,11 +806,14 @@ if USING_API and not st.session_state.token and not st.session_state.logged_out:
         except requests.RequestException:
             me = None
         if me is not None and me.ok:
-            data = me.json()
-            st.session_state.token = remembered
-            st.session_state.username = data["username"]
-            st.session_state.is_admin = bool(data.get("is_admin"))
-            st.session_state._admin_checked_at = time.time()
+            data = _decode_json_body(me)
+            if data and data.get("username"):
+                st.session_state.token = remembered
+                st.session_state.username = data["username"]
+                st.session_state.is_admin = bool(data.get("is_admin"))
+                st.session_state._admin_checked_at = time.time()
+            else:
+                data = None          # malformed body — treat as no session
         elif me is not None and me.status_code in (401, 403):
             _write_session_cookie(None)  # expired/revoked — drop it
         # network error: keep the cookie, try again on the next load
@@ -770,9 +834,10 @@ if USING_API and st.session_state.token and not st.session_state.logged_out:
             me = None
         st.session_state._admin_checked_at = time.time()
         if me is not None and me.ok:
-            data = me.json()
-            st.session_state.username = data.get("username") or st.session_state.username
-            st.session_state.is_admin = bool(data.get("is_admin"))
+            data = _decode_json_body(me)
+            if data:
+                st.session_state.username = data.get("username") or st.session_state.username
+                st.session_state.is_admin = bool(data.get("is_admin"))
         elif me is not None and me.status_code in (401, 403):
             # Token revoked (logout elsewhere) or expired — fail closed.
             st.session_state.token = None
@@ -1044,18 +1109,24 @@ if page == "🛠 Admin":
     hero("Mission Control", "Admin Dashboard",
          "Every user, every analysis, every trend — monitored live from the API.",
          api_ok=True)
-    try:
-        overview = requests.get(f"{API_URL}/admin/overview", headers=api_headers(), timeout=15)
-        users_resp = requests.get(f"{API_URL}/admin/users", headers=api_headers(), timeout=15)
-        trends = requests.get(f"{API_URL}/admin/trends?days=30", headers=api_headers(), timeout=15)
-    except requests.RequestException as exc:
-        st.error(f"Admin API unreachable: {exc}")
-        st.stop()
-    if overview.status_code in (401, 403):
+    overview, ov, ov_err = api_fetch_json("/admin/overview")
+    users_resp, ub, ub_err = api_fetch_json("/admin/users")
+    trends, tr, tr_err = api_fetch_json("/admin/trends", params={"days": 30})
+
+    responses = (overview, users_resp, trends)
+    if any(r is not None and r.status_code == 401 for r in responses):
+        _drop_session()                     # token expired/revoked — re-login
+        st.rerun()
+    if any(r is not None and r.status_code == 403 for r in responses):
         st.error("Admin access required.")
         st.stop()
-
-    ov = overview.json()
+    errors = [e for e in (ov_err, ub_err, tr_err) if e]
+    if errors or ov is None or ub is None or tr is None:
+        # Backend unreachable, proxy 502 with an empty/HTML body, or a storage
+        # hiccup — this used to crash the page with a JSONDecodeError traceback.
+        _api_retry_panel("The admin API", errors[0] if errors else None)
+        footer()
+        st.stop()
     kpi_strip([
         {"icon": "👥", "label": "Users", "animate": ov["total_users"]},
         {"icon": "🧾", "label": "Jobs", "animate": ov["total_jobs"]},
@@ -1066,7 +1137,6 @@ if page == "🛠 Admin":
          "animate": ov["avg_match_score"], "suffix": "%", "dec": 1},
     ])
 
-    tr = trends.json()
     grad_divider()
     tcol1, tcol2 = st.columns(2)
     with tcol1:
@@ -1148,7 +1218,6 @@ if page == "🛠 Admin":
     grad_divider()
     with st.container(border=True):
         card_title("👥 Registered Users")
-        ub = users_resp.json()
         users_df = pd.DataFrame(ub["users"])
         if not users_df.empty:
             users_df["joined"] = users_df["created_at"].str[:10]
@@ -1205,10 +1274,11 @@ if page == "🛠 Admin":
                 format_func=lambda u: f"{u['username']} ({u['jobs']} jobs)",
             )
             if choice:
-                jobs_resp = requests.get(f"{API_URL}/admin/users/{choice['id']}/jobs",
-                                         headers=api_headers(), timeout=15)
-                if jobs_resp.ok:
-                    ujobs = jobs_resp.json()["jobs"]
+                jresp, jdata, jerr = api_fetch_json(
+                    f"/admin/users/{choice['id']}/jobs"
+                )
+                if jdata is not None:
+                    ujobs = jdata.get("jobs") or []
                     if ujobs:
                         # Select defensively: hard-indexing a column the API
                         # does not return raises a pandas KeyError and takes
@@ -1222,6 +1292,9 @@ if page == "🛠 Admin":
                                      width="stretch")
                     else:
                         st.caption(f"{choice['username']} has no analyses yet.")
+                else:
+                    st.warning(f"Could not load analyses for "
+                               f"{choice['username']}: {jerr}")
     footer()
     st.stop()
 
@@ -1229,36 +1302,49 @@ if page == "🛠 Admin":
 if page == "🗂 My History":
     hero("Your personal archive", "My Analysis History",
          "Every screening you've ever run — filterable, inspectable, exportable.", api_ok=True)
-    try:
-        resp = requests.get(f"{API_URL}/history", headers=api_headers(), timeout=15)
-    except requests.RequestException as exc:
-        st.error(f"Could not load history: {exc}")
-        st.stop()
-    if resp.status_code == 401:
+    hcol_r, hcol_sp = st.columns([4, 1])
+    with hcol_r:
+        st.caption("Analyses are saved to your account the moment they "
+                   "complete — refresh to pull the latest.")
+    with hcol_sp:
+        if st.button("🔄 Refresh", key="refresh_history", width="stretch"):
+            st.rerun()
+
+    resp, hdata, herr = api_fetch_json("/history")
+    if resp is not None and resp.status_code == 401:
         _drop_session("Session expired — please log in again.")
         st.rerun()
+    if hdata is None:
+        # Unreachable API, empty proxy body, or a storage blip — previously
+        # resp.json() here could kill the page with a JSONDecodeError.
+        _api_retry_panel("The history API", herr)
+        footer()
+        st.stop()
 
-    jobs = resp.json()["jobs"]
+    jobs = hdata.get("jobs") or []
     if not jobs:
         with st.container(border=True):
             card_title("🌱 Nothing here yet")
             st.markdown("Run a screening on the **🔍 Screening** page and it will appear here — "
                         "scored, classified and ready to export.")
+        footer()
         st.stop()
 
     hist = pd.DataFrame([
         {
-            "Candidate": j["filename"],
-            "Score": j["jd_match_score"],
-            "Role": j["predicted_role"],
-            "Skills": j["skills_extracted"],
-            "Status": j["status"],
-            "Date": (j["created_at"] or "")[:16].replace("T", " "),
-            "job_id": j["job_id"],
+            "Candidate": j.get("filename", "?"),
+            "Score": j.get("jd_match_score"),
+            "Role": j.get("predicted_role"),
+            "Skills": j.get("skills_extracted"),
+            "Status": j.get("status", "?"),
+            "Date": (j.get("created_at") or "")[:16].replace("T", " "),
+            "job_id": j.get("job_id"),
             "_fields": j.get("extracted_fields"),
         }
         for j in jobs
     ])
+    # Scores can be None for pending rows; coerce so mean()/max() never blow up.
+    hist["Score"] = pd.to_numeric(hist["Score"], errors="coerce")
 
     done = hist[hist["Status"] == "completed"]
     kpi_strip([
@@ -1308,10 +1394,20 @@ if page == "📈 Analytics":
         )
         st.stop()
 
-    try:
-        summary = requests.get(f"{API_URL}/analytics/summary", timeout=10).json()
-    except requests.RequestException as exc:
-        st.error(f"Could not load analytics: {exc}")
+    acol_r, acol_sp = st.columns([4, 1])
+    with acol_r:
+        st.caption("Aggregated live from every completed screening — "
+                   "refresh to pull the latest numbers.")
+    with acol_sp:
+        if st.button("🔄 Refresh", key="refresh_analytics", width="stretch"):
+            st.rerun()
+
+    _resp, summary, aerr = api_fetch_json("/analytics/summary", timeout=15)
+    if summary is None:
+        # Used to be requests.get(...).json() — an empty/HTML proxy body or a
+        # storage blip crashed this page with a JSONDecodeError traceback.
+        _api_retry_panel("The analytics API", aerr)
+        footer()
         st.stop()
 
     kpi_strip([

@@ -31,6 +31,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import load_only
 
 import auth
 import monitoring
@@ -94,6 +95,29 @@ ADMIN_STRICT_SYNC = os.environ.get("ADMIN_STRICT_SYNC", "0").lower() in ("1", "t
 ADMIN_BOOTSTRAP_FIRST_USER = os.environ.get(
     "ADMIN_BOOTSTRAP_FIRST_USER", "1"
 ).lower() in ("1", "true", "yes")
+
+# Duplicate-detection namespace for identical (resume bytes + JD) submissions:
+#   user   (default) — each ACCOUNT gets its own analysis row. The same file
+#                      re-uploaded by the same account is still a cache hit,
+#                      but a different user's run always lands in THEIR
+#                      history. (The old global hash silently attributed the
+#                      run to whoever screened the file first — everyone else
+#                      saw "history not updating".)
+#   global — legacy behaviour: one row per unique file+JD instance-wide.
+#   off    — never short-circuit; record every single run (demo mode).
+DEDUP_SCOPE = os.environ.get("DEDUP_SCOPE", "user").strip().lower() or "user"
+if DEDUP_SCOPE not in ("user", "global", "off"):
+    logger.warning("unknown DEDUP_SCOPE %r; falling back to 'user'", DEDUP_SCOPE)
+    DEDUP_SCOPE = "user"
+
+
+def _dedup_scope_for(user_id: int | None) -> str:
+    """Hash namespace for this request under the configured DEDUP_SCOPE."""
+    if DEDUP_SCOPE == "global":
+        return ""
+    if DEDUP_SCOPE == "off":
+        return uuid.uuid4().hex      # unique salt => always a fresh row
+    return f"user:{user_id}" if user_id else "anon"
 
 app.add_middleware(
     CORSMiddleware,
@@ -198,6 +222,13 @@ def _require_admin(x_user_token: str | None) -> int:
         if not user or not user.is_admin:
             raise HTTPException(status_code=403, detail="Admin privileges required")
         return user_id
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("admin check failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication store is temporarily unavailable. Retry.",
+        )
     finally:
         db.close()
 
@@ -461,7 +492,7 @@ async def single_analyze(
         raise HTTPException(status_code=400, detail="Job description is empty.")
 
     user_id = _current_user_id(x_user_token) if x_user_token else None
-    dedup_hash = make_dedup_hash(payload, jd)
+    dedup_hash = make_dedup_hash(payload, jd, scope=_dedup_scope_for(user_id))
 
     db = SessionLocal()
     try:
@@ -470,9 +501,13 @@ async def single_analyze(
         ).first()
 
         if existing is not None and existing.status == JobStatus.COMPLETED:
+            # Cache hit. Adopt an unowned row when a signed-in user re-runs an
+            # anonymous analysis, and ALWAYS touch updated_at so the Admin
+            # page's "last active" (and dedup freshness) reflects the re-run.
             if user_id and not existing.user_id:
                 existing.user_id = user_id
-                db.commit()
+            existing.updated_at = _utcnow()
+            db.commit()
             return _completed_payload(existing, duplicate=True)
 
         try:
@@ -642,8 +677,17 @@ def history(x_user_token: str | None = Header(default=None)):
     user_id = _require_user_id(x_user_token)
     db = SessionLocal()
     try:
+        # Only the columns the History page renders — the previous full-entity
+        # load dragged resume_text + job_description (hundreds of KB per row)
+        # over the wire for up to 200 rows, making the page needlessly slow.
         jobs = (
             db.query(ResumeResult)
+            .options(load_only(
+                ResumeResult.job_id, ResumeResult.filename,
+                ResumeResult.status, ResumeResult.jd_match_score,
+                ResumeResult.skills_extracted, ResumeResult.predicted_role,
+                ResumeResult.extracted_fields, ResumeResult.created_at,
+            ))
             .filter(ResumeResult.user_id == user_id)
             .order_by(ResumeResult.created_at.desc())
             .limit(200)
@@ -655,7 +699,7 @@ def history(x_user_token: str | None = Header(default=None)):
                 {
                     "job_id": j.job_id,
                     "filename": j.filename,
-                    "status": j.status.value,
+                    "status": j.status.value if hasattr(j.status, "value") else str(j.status),
                     "jd_match_score": j.jd_match_score,
                     "skills_extracted": j.skills_extracted,
                     "predicted_role": j.predicted_role,
@@ -665,42 +709,92 @@ def history(x_user_token: str | None = Header(default=None)):
                 for j in jobs
             ],
         }
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("history query failed for user %s: %s", user_id, exc)
+        raise HTTPException(
+            status_code=503,
+            detail="History is temporarily unavailable (storage). Retry in a moment.",
+        )
     finally:
         db.close()
 
 
 @app.get("/analytics/summary")
 def analytics_summary():
+    """Recruiter analytics (aggregate).
+
+    This endpoint used to ``db.query(ResumeResult).all()`` — hydrating every
+    resume_text/job_description TEXT blob in the table just to count rows.
+    On a filled database that turns into a multi-second (then multi-minute)
+    query: the platform proxy times out and returns an empty 502, which the
+    Streamlit UI tried to .json() and crashed on. Everything below is a
+    narrow-column aggregate — counts/AVG in SQL, Python only for splitting
+    the comma-separated skills column.
+    """
     db = SessionLocal()
     try:
-        rows = db.query(ResumeResult).all()
-        total = len(rows)
-        completed = [r for r in rows if r.status == JobStatus.COMPLETED]
-        scores = [r.jd_match_score for r in completed if r.jd_match_score is not None]
+        total = db.query(func.count(ResumeResult.job_id)).scalar() or 0
+
+        by_status: dict = {}
+        for value, count in (
+            db.query(ResumeResult.status, func.count(ResumeResult.job_id))
+            .group_by(ResumeResult.status)
+            .all()
+        ):
+            key = value.value if hasattr(value, "value") else str(value)
+            by_status[key] = count
+
+        scores = [
+            row[0]
+            for row in (
+                db.query(ResumeResult.jd_match_score)
+                .filter(ResumeResult.status == JobStatus.COMPLETED,
+                        ResumeResult.jd_match_score.isnot(None))
+                .all()
+            )
+        ]
         avg_score = sum(scores) / len(scores) if scores else 0.0
 
-        by_status = {}
-        for r in rows:
-            st = r.status.value if hasattr(r.status, "value") else str(r.status)
-            by_status[st] = by_status.get(st, 0) + 1
-
         role_dist = {}
-        skill_counts = {}
-        for r in completed:
-            if r.predicted_role:
-                role_dist[r.predicted_role] = role_dist.get(r.predicted_role, 0) + 1
-            if r.skills_extracted:
-                for s in r.skills_extracted.split(","):
-                    s_clean = s.strip()
-                    if s_clean:
-                        skill_counts[s_clean] = skill_counts.get(s_clean, 0) + 1
+        for role, count in (
+            db.query(ResumeResult.predicted_role, func.count(ResumeResult.job_id))
+            .filter(ResumeResult.status == JobStatus.COMPLETED,
+                    ResumeResult.predicted_role.isnot(None))
+            .group_by(ResumeResult.predicted_role)
+            .all()
+        ):
+            role_dist[role] = count
+
+        skill_counts: dict = {}
+        for (skills,) in (
+            db.query(ResumeResult.skills_extracted)
+            .filter(ResumeResult.status == JobStatus.COMPLETED,
+                    ResumeResult.skills_extracted.isnot(None))
+            .all()
+        ):
+            for s in skills.split(","):
+                s_clean = s.strip()
+                if s_clean:
+                    skill_counts[s_clean] = skill_counts.get(s_clean, 0) + 1
 
         top_skills = [
             {"skill": k, "count": v}
             for k, v in sorted(skill_counts.items(), key=lambda x: x[1], reverse=True)[:10]
         ]
 
-        recent = sorted(completed, key=lambda x: x.created_at or dt.datetime.min, reverse=True)[:10]
+        recent = (
+            db.query(ResumeResult)
+            .options(load_only(
+                ResumeResult.job_id, ResumeResult.filename,
+                ResumeResult.status, ResumeResult.jd_match_score,
+                ResumeResult.predicted_role, ResumeResult.created_at,
+            ))
+            .filter(ResumeResult.status == JobStatus.COMPLETED)
+            .order_by(ResumeResult.created_at.desc())
+            .limit(10)
+            .all()
+        )
         recent_jobs = [
             {
                 "job_id": r.job_id,
@@ -722,6 +816,13 @@ def analytics_summary():
             "top_skills": top_skills,
             "recent_jobs": recent_jobs,
         }
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("analytics summary failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Analytics is temporarily unavailable (storage). Retry in a moment.",
+        )
     finally:
         db.close()
 
@@ -750,12 +851,21 @@ def admin_overview(x_user_token: str | None = Header(default=None)):
     _require_admin(x_user_token)
     db = SessionLocal()
     try:
-        total_users = db.query(User).count()
-        total_jobs = db.query(ResumeResult).count()
-        completed = db.query(ResumeResult).filter(ResumeResult.status == JobStatus.COMPLETED).count()
-        rows = db.query(ResumeResult).all()
-        scores = [r.jd_match_score for r in rows if r.jd_match_score is not None]
-        avg_score = sum(scores) / len(scores) if scores else 0.0
+        # Pure SQL aggregates — the previous version hydrated EVERY result row
+        # (resume_text included) just to average a score, which is what made
+        # this endpoint slow enough for the proxy to 502 with an empty body.
+        total_users = db.query(func.count(User.id)).scalar() or 0
+        total_jobs = db.query(func.count(ResumeResult.job_id)).scalar() or 0
+        completed = (
+            db.query(func.count(ResumeResult.job_id))
+            .filter(ResumeResult.status == JobStatus.COMPLETED)
+            .scalar() or 0
+        )
+        avg_score = (
+            db.query(func.avg(ResumeResult.jd_match_score))
+            .filter(ResumeResult.jd_match_score.isnot(None))
+            .scalar()
+        ) or 0.0
 
         by_status: dict = {}
         for value, count in (
@@ -768,19 +878,26 @@ def admin_overview(x_user_token: str | None = Header(default=None)):
 
         week_ago = _utcnow() - dt.timedelta(days=7)
         jobs_last_7d = (
-            db.query(ResumeResult)
+            db.query(func.count(ResumeResult.job_id))
             .filter(ResumeResult.created_at >= week_ago)
-            .count()
+            .scalar() or 0
         )
 
         return {
             "total_users": total_users,
             "total_jobs": total_jobs,
             "completed_jobs": completed,
-            "avg_match_score": round(avg_score, 1),
+            "avg_match_score": round(float(avg_score), 1),
             "by_status": by_status,
             "jobs_last_7d": jobs_last_7d,
         }
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("admin overview failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Admin overview is temporarily unavailable (storage). Retry.",
+        )
     finally:
         db.close()
 
@@ -791,7 +908,6 @@ def admin_users(x_user_token: str | None = Header(default=None)):
     db = SessionLocal()
     try:
         users = db.query(User).order_by(User.created_at.desc()).all()
-
         # Single scan of the results table; aggregate per user in Python.
         # (Simple and correct: scores are NULL until a job completes, so
         # averages must skip NULLs rather than trust SQL AVG over mixed rows.)
@@ -838,6 +954,13 @@ def admin_users(x_user_token: str | None = Header(default=None)):
                 "last_active": la.isoformat() if la else None,
             })
         return {"total": len(out), "users": out}
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("admin users listing failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="User listing is temporarily unavailable (storage). Retry.",
+        )
     finally:
         db.close()
 
@@ -897,10 +1020,16 @@ def admin_user_jobs(uid: int, x_user_token: str | None = Header(default=None)):
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         jobs = (db.query(ResumeResult)
-                 .filter(ResumeResult.user_id == uid)
-                 .order_by(ResumeResult.created_at.desc())
-                 .limit(200)
-                 .all())
+                .options(load_only(
+                    ResumeResult.job_id, ResumeResult.filename,
+                    ResumeResult.status, ResumeResult.jd_match_score,
+                    ResumeResult.predicted_role, ResumeResult.skills_extracted,
+                    ResumeResult.created_at,
+                ))
+                .filter(ResumeResult.user_id == uid)
+                .order_by(ResumeResult.created_at.desc())
+                .limit(200)
+                .all())
         return {
             "user": {"id": user.id, "username": user.username, "email": user.email},
             "jobs": [
@@ -918,6 +1047,13 @@ def admin_user_jobs(uid: int, x_user_token: str | None = Header(default=None)):
                 for j in jobs
             ],
         }
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("admin user jobs failed for user %s: %s", uid, exc)
+        raise HTTPException(
+            status_code=503,
+            detail="User drill-down is temporarily unavailable (storage). Retry.",
+        )
     finally:
         db.close()
 
@@ -929,26 +1065,38 @@ def admin_trends(days: int = 30, x_user_token: str | None = Header(default=None)
     cutoff = _utcnow() - dt.timedelta(days=days)
     db = SessionLocal()
     try:
-        jobs = db.query(ResumeResult).filter(ResumeResult.created_at >= cutoff).all()
-        users = db.query(User).filter(User.created_at >= cutoff).all()
+        # Narrow-column selects: created_at / role / skills / score only — no
+        # resume_text or job_description blobs (they made this endpoint the
+        # slowest page in the dashboard).
+        jobs = (
+            db.query(
+                ResumeResult.created_at,
+                ResumeResult.predicted_role,
+                ResumeResult.skills_extracted,
+                ResumeResult.jd_match_score,
+            )
+            .filter(ResumeResult.created_at >= cutoff)
+            .all()
+        )
+        users = db.query(User.created_at).filter(User.created_at >= cutoff).all()
 
         jobs_per_day = {}
         prof_dist = {}
         skill_counts = {}
-        for j in jobs:
-            day_str = _day(j.created_at)
+        for created, role, skills, score in jobs:
+            day_str = _day(created)
             jobs_per_day[day_str] = jobs_per_day.get(day_str, 0) + 1
-            if j.predicted_role:
-                prof_dist[j.predicted_role] = prof_dist.get(j.predicted_role, 0) + 1
-            if j.skills_extracted:
-                for s in j.skills_extracted.split(","):
+            if role:
+                prof_dist[role] = prof_dist.get(role, 0) + 1
+            if skills:
+                for s in skills.split(","):
                     s_clean = s.strip()
                     if s_clean:
                         skill_counts[s_clean] = skill_counts.get(s_clean, 0) + 1
 
         signups_per_day = {}
-        for u in users:
-            day_str = _day(u.created_at)
+        for (created,) in users:
+            day_str = _day(created)
             signups_per_day[day_str] = signups_per_day.get(day_str, 0) + 1
 
         top_skills = [
@@ -956,9 +1104,7 @@ def admin_trends(days: int = 30, x_user_token: str | None = Header(default=None)
             for k, v in sorted(skill_counts.items(), key=lambda x: x[1], reverse=True)[:15]
         ]
 
-        trend_scores = [
-            j.jd_match_score for j in jobs if j.jd_match_score is not None
-        ]
+        trend_scores = [score for (_, _, _, score) in jobs if score is not None]
 
         return {
             "window_days": days,
@@ -968,5 +1114,12 @@ def admin_trends(days: int = 30, x_user_token: str | None = Header(default=None)
             "skill_distribution": top_skills,
             "score_histogram": _score_histogram(trend_scores),
         }
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("admin trends failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Admin trends are temporarily unavailable (storage). Retry.",
+        )
     finally:
         db.close()
