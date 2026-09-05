@@ -27,7 +27,8 @@ httpx==0.28.1          # REQUIRED by fastapi.testclient.TestClient (starlette
 # --- Optional ML extras, pinned so CI can exercise the ML code paths ---
 # The app degrades gracefully without these (see requirements.txt), but the
 # full test suite only reaches the classifier/NER branches when they exist.
-# Uncomment, or install in a dedicated "ml" CI job, to reach 88 passed /
-# 1 skip instead of the bare 79-pass / 10-skip run (89 tests collected).
+# Uncomment, or install in a dedicated "ml" CI job, to exercise those paths.
+# The pretrained NER test also needs en_core_web_sm. See the README's dated
+# verification results; use pytest's actual summary for current pass/skip counts.
 # scikit-learn==1.9.0
 # spacy==3.8.16
