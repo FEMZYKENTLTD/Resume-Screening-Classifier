@@ -340,7 +340,7 @@ def inject_css() -> None:
 
 
 def hero(eyebrow: str, title: str, subtitle: str, api_ok: bool) -> None:
-    status = "⚡ AI pipeline online" if api_ok else "🟠 Local mode — API offline"
+    status = "⚡ API mode" if api_ok else "🟠 Local mode — API offline"
     dot = "on" if api_ok else "off"
     st.markdown(
         f"""<div class="hero">
@@ -871,10 +871,10 @@ if USING_API and not st.session_state.token:
         st.warning("⚠️ The API is not responding right now — retrying. "
                    "Your account login will work again as soon as it wakes up.")
 
-    hero("3MTT Nextgen Capstone · AI-Powered Hiring",
+    hero("3MTT Nextgen Capstone · Resume Review",
          "ResumeRank",
-         "Screen resumes against any job description in seconds — semantic AI scoring, "
-         "smart field extraction, role prediction and recruiter analytics in one beautiful suite.",
+         "Compare resumes with a job description using weighted keyword coverage, "
+         "role suggestions and extracted fields. Results support a human review, not a hiring decision.",
          api_ok=True)
     _l, mid, _r = st.columns([1, 1.9, 1])
     with mid:
@@ -898,7 +898,7 @@ if USING_API and not st.session_state.token:
                 with st.form("signup_form"):
                     su_user = st.text_input("Choose a username (min 3 chars)")
                     su_email = st.text_input("Email")
-                    su_pass = st.text_input("Password (min 6 chars)", type="password")
+                    su_pass = st.text_input("Password (min 8 chars)", type="password")
                     su_pass2 = st.text_input("Confirm password", type="password")
                     if st.form_submit_button("Create Account ✨", width="stretch"):
                         if su_pass != su_pass2:
@@ -917,7 +917,7 @@ if USING_API and not st.session_state.token:
             """<div class="steps">
   <div class="step"><div class="n">📄</div><div><b>Paste the job post</b><small>any JD, any role</small></div></div>
   <div class="step"><div class="n">📂</div><div><b>Drop in resumes</b><small>PDF &amp; DOCX, one or many</small></div></div>
-  <div class="step"><div class="n">🏆</div><div><b>Get instant rankings</b><small>scores, roles &amp; insights</small></div></div>
+  <div class="step"><div class="n">🏆</div><div><b>Review rankings</b><small>scores, roles &amp; insights</small></div></div>
 </div>""",
             unsafe_allow_html=True,
         )
@@ -1010,7 +1010,7 @@ initial = (st.session_state.username or "?")[0].upper()
 badge = '<span class="adminbadge">ADMIN</span>' if st.session_state.is_admin else ""
 st.sidebar.markdown(
     f"""<div class="brand"><div class="logo">🎯</div>
-  <div><div class="bname">ResumeRank</div><div class="bsub">AI Screening Suite</div></div></div>
+  <div><div class="bname">ResumeRank</div><div class="bsub">Resume Review Tool</div></div></div>
 <div class="userchip"><div class="ava">{initial}</div>
   <div><div class="un">{_html.escape(str(st.session_state.username))}{badge}</div>
   <div class="ur">{"Administrator" if st.session_state.is_admin else "Recruiter"}</div></div></div>""",
@@ -1116,8 +1116,8 @@ def download_exports(df, stem: str):
 
 # =============================== ADMIN PAGE ===============================
 if page == "🛠 Admin":
-    hero("Mission Control", "Admin Dashboard",
-         "Every user, every analysis, every trend — monitored live from the API.",
+    hero("Administration", "Admin Dashboard",
+         "Review saved job counts, user activity and account permissions.",
          api_ok=True)
     overview, ov, ov_err = api_fetch_json("/admin/overview")
     users_resp, ub, ub_err = api_fetch_json("/admin/users")
@@ -1311,11 +1311,11 @@ if page == "🛠 Admin":
 # =============================== HISTORY PAGE ===============================
 if page == "🗂 My History":
     hero("Your personal archive", "My Analysis History",
-         "Every screening you've ever run — filterable, inspectable, exportable.", api_ok=True)
+         "Your latest saved API analyses — filterable, inspectable, exportable.", api_ok=True)
     hcol_r, hcol_sp = st.columns([4, 1])
     with hcol_r:
-        st.caption("Analyses are saved to your account the moment they "
-                   "complete — refresh to pull the latest.")
+        st.caption("Completed API analyses are saved to your account. Local fallback "
+                   "results are not saved by the UI — refresh to check your history.")
     with hcol_sp:
         if st.button("🔄 Refresh", key="refresh_history", width="stretch"):
             st.rerun()
@@ -1395,8 +1395,9 @@ if page == "🗂 My History":
 
 # =============================== ANALYTICS PAGE ===============================
 if page == "📈 Analytics":
-    hero("Recruiter intelligence", "Analytics",
-         "What the pipeline has learned across every resume it has screened.", api_ok=USING_API)
+    hero("Saved-analysis summaries", "Analytics",
+         "Counts and score distributions across saved analyses, not a measure of prediction accuracy.",
+         api_ok=USING_API)
     if not USING_API:
         st.info(
             "Analytics reads from Postgres via the API — start the backend "
@@ -1507,9 +1508,9 @@ if page == "📈 Analytics":
     st.stop()
 
 # =============================== SCREENING PAGE ===============================
-hero("AI-Powered Resume Screening", "Screen. Score. Hire.",
-     "Paste a job description, drop in resumes, and let the pipeline rank every "
-     "candidate — semantic matching, entity extraction and role prediction included.",
+hero("Resume Screening", "Compare. Score. Review.",
+     "Compare keyword coverage across resumes. Check role suggestions and extracted "
+     "fields against the originals; rankings are not hiring decisions.",
      api_ok=USING_API)
 
 st.sidebar.markdown("---")
@@ -1519,14 +1520,14 @@ st.sidebar.markdown(
 2. Upload resumes — **PDF or DOCX**.
 3. Pick **Single** or **Batch** mode.
 4. Hit **⚡ Run AI Analysis**.
-5. Scores, roles, extracted fields, rankings & exports — all saved to **🗂 My History**.
+5. Signed-in API results appear in **🗂 My History**. Local fallback results are not saved by the UI.
 """)
 
 st.markdown(
     """<div class="steps">
   <div class="step"><div class="n">1️⃣</div><div><b>Paste the JD</b><small>keywords &amp; skills auto-extracted</small></div></div>
   <div class="step"><div class="n">2️⃣</div><div><b>Upload resumes</b><small>PDF / DOCX · multi-file</small></div></div>
-  <div class="step"><div class="n">3️⃣</div><div><b>AI ranks everyone</b><small>score · role · fields · badges</small></div></div>
+  <div class="step"><div class="n">3️⃣</div><div><b>Compare the results</b><small>keyword scores · role suggestions · fields</small></div></div>
 </div>""",
     unsafe_allow_html=True,
 )
@@ -1619,7 +1620,7 @@ if run_clicked and ready:
         seen_names[name] = seen
         return name if seen == 1 else f"{name} ({seen})"
 
-    with st.status("✨ AI pipeline working its magic…", expanded=True) as status_box:
+    with st.status("Processing resumes…", expanded=True) as status_box:
         for i, resume in enumerate(resumes, start=1):
             label = _unique_label(resume.name)
             st.write(f"🔎 `{resume.name}` — parsing, scoring, classifying…")
@@ -1778,6 +1779,7 @@ if screen:
         download_exports(df_sorted[["Candidate", "Score", "Badge", "Role", "Matched Keywords"]],
                          "resume_analysis_results")
         if st.session_state.token:
-            st.caption("💾 Saved to your account — see **🗂 My History** for all past analyses.")
+            st.caption("💾 API results are saved to your account; local fallback results are not "
+                       "saved by the UI. Check **🗂 My History** to confirm.")
 
 footer()

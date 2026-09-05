@@ -1,20 +1,22 @@
 # 🎯 ResumeRank — Engineering Audit & Verification Report
 
 **To:** FEMZYKENTLTD / Olufemi Benua Keripe (FEMZY)
-**From:** Principal Machine Learning Engineer & Architect (25+ Years Experience)
+**Document type:** Historical engineering notes, not an independent audit or certification
 **Date:** August 31, 2026
 **Subject:** Repository ownership handover, CI failure root-cause analysis, README verification audit
 **Scope:** commit `910fcf6` on `main` (failng run: [Verify & Deploy #33447066825](https://github.com/FEMZYKENTLTD/Resume-Screening-Classifier/actions/runs/33447066825))
 
-> ⚠️ **Historical document.** The numbers below were correct on 2026-08-31. They have since
-> been superseded — see [§5 Addendum — v1.0](#-5-addendum--v10-release-audit) at the end of
-> this file for the current, re-measured figures.
+> **Historical document.** This preserves earlier maintenance observations for the dated
+> scopes below, including the September 2 addendum. Those claims have not all been reverified
+> in this update and are not current deployment, security, or model-quality guarantees.
+> See the [README](../README.md#testing-and-verification) for the latest scoped verification
+> results and limitations. This is not an independent security or hiring-validity audit.
 
 ---
 
 ## 🏛️ 1. Ownership & Executive Summary
 
-I have taken ownership of the **Resume-Screening-Classifier** (`ResumeRank`) repository.
+This section records earlier maintenance of the **Resume-Screening-Classifier** (`ResumeRank`) repository.
 
 **Verdict at handover: 🔴 CI RED → 🟢 FIXED.** The repository was **not** deployable: the
 `Verify & Deploy Full Stack` workflow failed in the `verify` job (`pytest -q` exit code 2),
@@ -87,9 +89,7 @@ verification plan.
    `FLY_API_TOKEN` / `RENDER_API_KEY` secrets and push-to-main).
 
 ---
-*Signed,*
-**Principal Machine Learning Engineer & Architect**
-*ResumeRank Platform Owner*
+*Historical maintenance notes; see the dated scope above.*
 
 ---
 
@@ -107,7 +107,7 @@ carried over from the report above.
 | 2 | "Stuck on the login page" | A single 3 s `/health` probe against a cold API flipped the UI into the legacy env-credential login, which database accounts can never pass | Probe retried ×3, cached 30 s, sticky once seen up; `ALLOW_LEGACY_LOGIN=0` disables the fallback; legacy mode also gained the **Log out** button it never had |
 | 3 | "My admin account doesn't reflect as admin" | `/auth/login` mirrored `ADMIN_USERNAMES` onto `users.is_admin`, demoting every DB-granted admin on sign-in (reproduced: `is_admin` 1 → 0) | Grant-only sync (`ADMIN_STRICT_SYNC=1` to opt out), owner bootstrap, `POST /admin/users/{id}/admin` + Roles & Access UI, `scripts/grant_admin.py`, live `/auth/me` refresh every 30 s |
 | 4 | Stale CI handoff | The Node 24 workflow fix had been applied, but a 109-line duplicate (`docs/deploy.yml.node24`) and its instructions lingered | Duplicate deleted; the single remaining one-line CI improvement is documented inline in `requirements-dev.txt` (workflow edits need `workflows` token permission) |
-| 5 | README drift | Undocumented `/auth/me`; stale counts (tests, live checks, Alembic revisions); duplicated `training/` entry in the file tree; broken LinkedIn markdown link; version sprawl (v5.5 → v5.9) | README corrected end-to-end and **relabelled to a single version: v1.0** |
+| 5 | README drift | Undocumented `/auth/me`; stale counts (tests, live checks, Alembic revisions); duplicated `training/` entry in the file tree; broken LinkedIn markdown link; inconsistent release labels | README corrected end-to-end and **relabelled to a single version: v1.0** |
 
 ### Verification (all executed on this branch)
 
@@ -130,4 +130,4 @@ carried over from the report above.
 | Every documented endpoint exists, and every endpoint is documented | ✅ 15 routes reconciled both ways |
 | Alembic single linear head, auto-applied on deploy | ✅ verified (`wait-for-db.sh` + Fly `release_command`) |
 
-*Signed,* **Platform Owner — v1.0 release audit**
+*End of historical v1.0 release notes.*
